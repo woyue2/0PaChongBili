@@ -126,7 +126,6 @@ class Database:
     def __init__(self, db_file):
         self._local = threading.local()
         self._db_file = db_file
-        self._init_conn()
         self.create_tables()
 
     @property
@@ -136,11 +135,6 @@ class Database:
             self._local.conn.execute("PRAGMA journal_mode=WAL")
             self._local.conn.execute("PRAGMA busy_timeout=5000")
         return self._local.conn
-
-    def _init_conn(self):
-        self._local.conn = sqlite3.connect(self._db_file)
-        self._local.conn.execute("PRAGMA journal_mode=WAL")
-        self._local.conn.execute("PRAGMA busy_timeout=5000")
 
     def create_tables(self):
         cursor = self.conn.cursor()
@@ -298,7 +292,7 @@ class Database:
                         WHERE video_age_hours > 0 AND (play_velocity IS NULL OR play_velocity = 0)
                     """)
                     print(f"[数据库] 已回填 {backfilled} 条视频的 video_age_hours 和 play_velocity")
-            except:
+            except Exception:
                 pass
 
         # 回填旧数据的 engagement_score
@@ -315,7 +309,7 @@ class Database:
                 """)
                 if cursor.rowcount > 0:
                     print(f"[数据库] 已回填 {cursor.rowcount} 条视频的 engagement_score")
-            except:
+            except Exception:
                 pass
 
     def create_task(self, keyword, pages, order_by):
@@ -564,116 +558,6 @@ class Database:
         row = cursor.fetchone()
         return {"total": row[0], "success": row[1] or 0}
 
-    MIN_TIME_SPAN_HOURS = 48
-
-    def _parse_timestamp(self, timestamp_str):
-        if not timestamp_str:
-            return None
-        try:
-            return datetime.strptime(timestamp_str, "%Y-%m-%d %H:%M:%S.%f")
-        except ValueError:
-            try:
-                return datetime.strptime(timestamp_str, "%Y-%m-%d %H:%M:%S")
-            except ValueError:
-                try:
-                    return datetime.fromisoformat(timestamp_str)
-                except:
-                    return None
-
-    def calculate_momentum(self, av_id, metrics=None, video_pubdate=None):
-        if metrics is None:
-            metrics = ["play_nums", "danmakus", "favorites", "review", "like_count"]
-
-        cursor = self.conn.cursor()
-        cursor.execute("""
-            SELECT * FROM video_history
-            WHERE av_id = ?
-            ORDER BY record_time ASC
-        """, (av_id,))
-        records = cursor.fetchall()
-        col_names = [desc[0] for desc in cursor.description]
-        records_dict = [dict(zip(col_names, record)) for record in records]
-
-        result = {
-            "av_id": av_id,
-            "data_points": len(records_dict),
-            "time_span_hours": 0,
-            "status": "no_data",
-            "status_desc": "无历史数据",
-            "metrics": {},
-            "composite_score": None
-        }
-
-        if len(records_dict) == 0:
-            return result
-
-        if len(records_dict) == 1:
-            result["status"] = "first_record"
-            result["status_desc"] = "首次采集，仅显示当前值"
-            for metric in metrics:
-                result["metrics"][metric] = {
-                    "current": records_dict[0].get(metric, 0),
-                    "total_growth_pct": None,
-                    "cagr_daily_pct": None,
-                    "avg_incremental_pct": None,
-                    "is_momentum_valid": False
-                }
-            return result
-
-        first_time = self._parse_timestamp(records_dict[0]["record_time"])
-        last_time = self._parse_timestamp(records_dict[-1]["record_time"])
-        if first_time and last_time:
-            time_span_hours = (last_time - first_time).total_seconds() / 3600
-        else:
-            time_span_hours = 0
-        result["time_span_hours"] = round(time_span_hours, 2)
-
-        is_time_valid = time_span_hours >= self.MIN_TIME_SPAN_HOURS
-
-        if not is_time_valid:
-            result["status"] = "data_insufficient"
-            result["status_desc"] = f"数据积累中（需≥{self.MIN_TIME_SPAN_HOURS}小时，当前{time_span_hours:.1f}小时）"
-        else:
-            result["status"] = "momentum_ready"
-            result["status_desc"] = "动量可计算"
-
-        for metric in metrics:
-            values = [r.get(metric, 0) for r in records_dict]
-            current = values[-1]
-            previous = values[0]
-
-            metric_result = {
-                "current": current,
-                "total_growth_pct": None,
-                "cagr_daily_pct": None,
-                "avg_incremental_pct": None,
-                "is_momentum_valid": is_time_valid
-            }
-
-            if is_time_valid and previous > 0:
-                total_growth = (current - previous) / previous * 100
-                metric_result["total_growth_pct"] = round(total_growth, 2)
-
-                time_span_days = max(time_span_hours / 24, 0.5)
-                cagr = ((current / previous) ** (1 / time_span_days) - 1) * 100
-                metric_result["cagr_daily_pct"] = round(cagr, 2)
-
-                if len(values) >= 3:
-                    changes = [(values[i] - values[i - 1]) / max(values[i - 1], 1) * 100
-                               for i in range(1, len(values))]
-                    metric_result["avg_incremental_pct"] = round(sum(changes) / len(changes), 2)
-
-            result["metrics"][metric] = metric_result
-
-        if video_pubdate and result["status"] == "momentum_ready":
-            try:
-                pubdate_dt = datetime.strptime(video_pubdate, "%Y-%m-%d %H:%M:%S")
-                age_days = (datetime.now() - pubdate_dt).days
-                result["video_age_days"] = age_days
-            except:
-                result["video_age_days"] = None
-
-        return result
 
     def calculate_freshness_weight(self, video_age_days):
         if video_age_days is None or video_age_days < 0:
@@ -775,7 +659,7 @@ class Database:
                     history = [float(r[0]) for r in h_cursor.fetchall()]
                     if history and history[0] > 0:
                         historical_growth = round((history[-1] - history[0]) / history[0] * 100, 2)
-            except:
+            except Exception:
                 pass
 
             video_info = {
@@ -813,146 +697,6 @@ class Database:
         results.sort(key=lambda x: x["composite_score"], reverse=True)
         return results[:limit]
 
-    # ========== 价值评分排名 ==========
-
-    def get_keyword_value_ranking(self, keyword, limit=20):
-        """
-        价值评分排名：衡量视频的长期内容价值。
-
-        评分维度（全部归一化到 0~1）：
-          - 深度互动比 (35%): (coin+favorite) / like
-          - 互动密度   (25%): (like+coin+fav+reply+danmaku) / play
-          - 收藏率     (20%): favorite / play
-          - 粉丝转化率 (10%): play / fans
-          - 分享率     (10%): share / play
-        """
-        cursor = self.conn.cursor()
-        cursor.execute("""
-            SELECT v.av_id, v.title, v.play_nums, v.pubdate, v.uploader, v.uploader_uid, v.uploader_fans,
-                   v.like_count, v.coin, v.favorites, v.share, v.danmakus, v.review,
-                   v.video_age_hours, v.engagement_score
-            FROM bili_videos v
-            JOIN spider_tasks t ON v.task_id = t.id
-            WHERE t.keyword = ?
-            ORDER BY v.play_nums DESC
-        """, (keyword,))
-        videos = cursor.fetchall()
-
-        if not videos:
-            return []
-
-        # 第一遍：计算所有原始值，确定极值用于归一化
-        raw_list = []
-        for v in videos:
-            (av_id, title, play_nums, pubdate, uploader, uploader_uid, uploader_fans,
-             like_count, coin, favorites, share, danmakus, review,
-             video_age_hours, engagement_score) = v
-
-            play_nums = int(play_nums or 0)
-            like_count = int(like_count or 0)
-            coin = int(coin or 0)
-            favorites = int(favorites or 0)
-            share_count = int(share or 0)
-            danmakus = int(danmakus or 0)
-            review_count = int(review or 0)
-            uploader_fans = int(uploader_fans or 0)
-            video_age_hours = float(video_age_hours or 0)
-
-            # 深度互动比: (投币+收藏) / 点赞
-            deep_ratio = (coin + favorites) / max(like_count, 1)
-
-            # 互动密度
-            total_interaction = like_count + coin + favorites + review_count + danmakus
-            engagement_density = total_interaction / max(play_nums, 1)
-
-            # 收藏率
-            fav_rate = favorites / max(play_nums, 1)
-
-            # 粉丝转化率
-            conv_rate = play_nums / max(uploader_fans, 1) if uploader_fans > 0 else 0
-
-            # 分享率
-            share_rate = share_count / max(play_nums, 1)
-
-            raw_list.append({
-                "av_id": av_id,
-                "title": title,
-                "play_nums": play_nums,
-                "pubdate": pubdate,
-                "uploader": uploader,
-                "uploader_uid": uploader_uid,
-                "uploader_fans": uploader_fans,
-                "like_count": like_count,
-                "coin": coin,
-                "favorites": favorites,
-                "share": share_count,
-                "danmakus": danmakus,
-                "review": review_count,
-                "video_age_hours": video_age_hours,
-                "deep_ratio": deep_ratio,
-                "engagement_density": engagement_density,
-                "fav_rate": fav_rate,
-                "conv_rate": conv_rate,
-                "share_rate": share_rate,
-            })
-
-        # 计算各维度极值
-        max_deep = max(r["deep_ratio"] for r in raw_list) or 1
-        max_eng = max(r["engagement_density"] for r in raw_list) or 1
-        max_fav = max(r["fav_rate"] for r in raw_list) or 1
-        max_conv = max(r["conv_rate"] for r in raw_list) or 1
-        max_share = max(r["share_rate"] for r in raw_list) or 1
-
-        # 第二遍：归一化 + 计算综合分
-        results = []
-        for r in raw_list:
-            deep_score = min(r["deep_ratio"] / max_deep, 1.0) if max_deep > 0 else 0
-            eng_score = min(r["engagement_density"] / max_eng, 1.0) if max_eng > 0 else 0
-            fav_score = min(r["fav_rate"] / max_fav, 1.0) if max_fav > 0 else 0
-            conv_score = min(r["conv_rate"] / max_conv, 1.0) if max_conv > 0 else 0
-            share_score = min(r["share_rate"] / max_share, 1.0) if max_share > 0 else 0
-
-            value_score = (
-                deep_score * 0.35 +
-                eng_score * 0.25 +
-                fav_score * 0.20 +
-                conv_score * 0.10 +
-                share_score * 0.10
-            )
-
-            results.append({
-                "av_id": r["av_id"],
-                "title": r["title"],
-                "current_value": r["play_nums"],
-                "pubdate": r["pubdate"],
-                "uploader": r["uploader"],
-                "uploader_uid": r["uploader_uid"],
-                "uploader_fans": r["uploader_fans"],
-                "like_count": r["like_count"],
-                "coin": r["coin"],
-                "favorites": r["favorites"],
-                "share": r["share"],
-                "danmakus": r["danmakus"],
-                "review": r["review"],
-                "video_age_hours": r["video_age_hours"],
-                # 原始值
-                "deep_ratio": round(r["deep_ratio"], 4),
-                "engagement_density": round(r["engagement_density"], 4),
-                "fav_rate": round(r["fav_rate"], 4),
-                "conv_rate": round(r["conv_rate"], 2),
-                "share_rate": round(r["share_rate"], 4),
-                # 归一化得分
-                "deep_score": round(deep_score, 4),
-                "eng_score": round(eng_score, 4),
-                "fav_score": round(fav_score, 4),
-                "conv_score": round(conv_score, 4),
-                "share_score": round(share_score, 4),
-                # 综合分
-                "value_score": round(value_score, 4),
-            })
-
-        results.sort(key=lambda x: x["value_score"], reverse=True)
-        return results[:limit]
 
     def close(self):
         if hasattr(self._local, 'conn') and self._local.conn:

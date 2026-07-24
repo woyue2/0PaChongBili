@@ -54,6 +54,57 @@ class BiliSpider:
             headers = self.cookie_mgr.get_headers()
         return WbiSigner.sign(params, headers)
 
+    def fetch_popular_page(self, page, max_retries=3):
+        """获取B站全站热门视频列表（/x/web-interface/popular）"""
+        params = {
+            "ps": 20,
+            "pn": page,
+        }
+
+        for attempt in range(max_retries):
+            headers = self.cookie_mgr.get_headers("https://www.bilibili.com/")
+            try:
+                signed_params = self.get_wbi_signed_params(params.copy(), headers)
+                url = f"https://api.bilibili.com/x/web-interface/popular?{urlencode(signed_params)}"
+                resp = requests.get(url, headers=headers, timeout=15, verify=False)
+
+                if resp.status_code == 412:
+                    wait = (attempt + 1) * 5
+                    self.log(f"  [限流] 热门第{page}页 等待 {wait} 秒后重试 ({attempt+1}/{max_retries})...")
+                    time.sleep(wait)
+                    continue
+
+                if resp.status_code != 200:
+                    self.log(f"  [错误] 热门第{page}页 HTTP {resp.status_code}，重试 ({attempt+1}/{max_retries})...")
+                    time.sleep(random.uniform(2, 4))
+                    continue
+
+                data = resp.json()
+
+                if data["code"] != 0:
+                    msg = data.get("message", "未知错误")
+                    self.log(f"  [错误] 热门第{page}页: {msg}")
+                    with self.stats_lock:
+                        self.search_fail_count += 1
+                    return None
+
+                return data.get("data", {})
+
+            except requests.RequestException as e:
+                if attempt < max_retries - 1:
+                    self.log(f"  [异常] 热门第{page}页 请求异常，重试 ({attempt+1}/{max_retries})...")
+                    time.sleep(random.uniform(2, 4))
+                else:
+                    self.log(f"  [失败] 热门第{page}页 请求失败: {e}")
+                    with self.stats_lock:
+                        self.search_fail_count += 1
+                    return None
+
+        self.log(f"  [失败] 热门第{page}页 超过最大重试次数")
+        with self.stats_lock:
+            self.search_fail_count += 1
+        return None
+
     def search_page(self, keyword, page, order="click", max_retries=3):
         params = {
             "search_type": "video",
@@ -238,7 +289,7 @@ class BiliSpider:
             cached = cursor.fetchone()
             if cached and cached[0] > 0:
                 return cached[0]
-        except:
+        except Exception:
             pass
 
         try:
@@ -247,7 +298,7 @@ class BiliSpider:
             cached_video = cursor.fetchone()
             if cached_video and cached_video[0] > 0:
                 return cached_video[0]
-        except:
+        except Exception:
             pass
 
         try:
@@ -257,7 +308,7 @@ class BiliSpider:
             result = cursor.fetchone()
             if result and result[0] > 0:
                 return result[0]
-        except:
+        except Exception:
             pass
 
         return 0
@@ -394,7 +445,7 @@ class BiliSpider:
                         self._pw_browser.close()
                     if self._pw:
                         self._pw.stop()
-                except:
+                except Exception:
                     pass
                 self._pw = None
                 self._pw_browser = None
@@ -408,7 +459,7 @@ class BiliSpider:
                     self._pw_browser.close()
                 if self._pw:
                     self._pw.stop()
-            except:
+            except Exception:
                 pass
             self._pw = None
             self._pw_browser = None
@@ -429,7 +480,7 @@ class BiliSpider:
             else:
                 cursor.execute("UPDATE bili_uploaders SET fans = ?, fetched_at = ? WHERE uid = ?", (fans, now, uid))
             self.db.conn.commit()
-        except:
+        except Exception:
             pass
 
     def fetch_video_detail(self, av_id):
@@ -497,14 +548,12 @@ class BiliSpider:
                 if not earliest_ctime:
                     return None
                 
-                from datetime import datetime
-                
                 if pubdate:
                     try:
                         pub_dt = datetime.strptime(pubdate.split('.')[0], '%Y-%m-%d %H:%M:%S')
                         pub_ts = int(pub_dt.timestamp())
                         actual_start = min(earliest_ctime, pub_ts)
-                    except:
+                    except Exception:
                         actual_start = earliest_ctime
                 else:
                     actual_start = earliest_ctime
@@ -689,6 +738,106 @@ class BiliSpider:
 
         self.log(f"\n[完成] 标签补充: 成功 {success}, 失败 {fail}")
 
+    def _fetch_and_insert_details(self, new_ids, log_prefix="搜索"):
+        """多线程获取视频详情并入库（公共方法，供 run / run_popular 复用）"""
+        self.log(f"\n[详情获取] 使用 {self.args.threads} 个线程获取视频详情...")
+        self.db.update_task(self.task_id, total_videos=len(new_ids))
+
+        with ThreadPoolExecutor(max_workers=self.args.threads) as executor:
+            futures = {executor.submit(self.fetch_video_detail, av_id): av_id for av_id in new_ids}
+
+            for i, future in enumerate(as_completed(futures), 1):
+                av_id = futures[future]
+                try:
+                    result_av_id, detail, error = future.result()
+                    if detail:
+                        self.db.insert_video(self.task_id, detail)
+                        with self.stats_lock:
+                            self.success_count += 1
+                        self.log(f"  [{i}/{len(new_ids)}] av{av_id} ✓")
+                    else:
+                        with self.stats_lock:
+                            self.fail_count += 1
+                        error_msg = error or "未知错误"
+                        self.db.insert_failed_video(self.task_id, av_id, "detail_fetch_failed", error_msg)
+                        self.log(f"  [{i}/{len(new_ids)}] av{av_id} ✗ ({error_msg})")
+                except Exception as e:
+                    with self.stats_lock:
+                        self.fail_count += 1
+                    self.db.insert_failed_video(self.task_id, av_id, "exception", str(e)[:100])
+                    self.log(f"  [{i}/{len(new_ids)}] av{av_id} ✗ (异常: {e})")
+
+        self.db.update_task(
+            self.task_id,
+            status="completed",
+            success_count=self.success_count,
+            fail_count=self.fail_count,
+            completed_at=datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        )
+        self.log(f"\n[{log_prefix}完成] 成功: {self.success_count}, 失败: {self.fail_count}")
+
+    def run_popular(self):
+        """全站热门模式：通过热门API采集全站热门视频，然后做动量分析"""
+        self.log("=" * 60)
+        self.log("  B站全站热门视频爬取")
+        self.log("=" * 60)
+        self.log(f"页数: {self.args.pages}")
+        self.log(f"线程数: {self.args.threads}")
+        self.log(f"延迟: {self.args.delay}s")
+        self.log("")
+
+        keyword = "全站热门"
+        self.task_id = self.db.create_task(
+            keyword, self.args.pages, "popular"
+        )
+        self.log(f"[任务] 任务ID: {self.task_id}")
+
+        all_av_ids = set()
+        failed_pages = []
+
+        for page in range(1, self.args.pages + 1):
+            self.log(f"[热门] 第 {page}/{self.args.pages} 页...")
+            data = self.fetch_popular_page(page)
+
+            if not data:
+                failed_pages.append(page)
+                self.log(f"  失败，跳过")
+                time.sleep(random.uniform(2, 4))
+                continue
+
+            results = data.get("list", [])
+            if not results:
+                self.log(f"  无结果，可能已到末页")
+                break
+
+            new_count = 0
+            for item in results:
+                av_id = str(item.get("aid", ""))
+                if av_id and av_id not in all_av_ids:
+                    all_av_ids.add(av_id)
+                    new_count += 1
+
+            total = data.get("no_more", False)
+            self.log(f"  找到 {len(results)} 个，新增 {new_count} 个" + (" (已到底)" if total else ""))
+            time.sleep(random.uniform(self.args.delay, self.args.delay + 1))
+
+            if total:
+                self.log(f"  热门列表已到底，停止翻页")
+                break
+
+        existing_ids = self.db.get_existing_av_ids()
+        new_ids = list(all_av_ids - existing_ids)
+
+        self.log(f"\n[搜索完成] 共 {len(all_av_ids)} 个视频，已有 {len(all_av_ids) - len(new_ids)} 个，新增 {len(new_ids)} 个")
+        self.log(f"[搜索统计] 失败页数: {len(failed_pages)}")
+
+        if not new_ids:
+            self.log("[完成] 没有新视频需要爬取")
+            self.db.update_task(self.task_id, status="completed", total_videos=len(all_av_ids))
+            return
+
+        self._fetch_and_insert_details(new_ids, "热门")
+
     def run(self):
         self.log("=" * 60)
         self.log("  B站视频爬虫 (增强版)")
@@ -744,45 +893,7 @@ class BiliSpider:
             self.db.update_task(self.task_id, status="completed", total_videos=len(all_av_ids))
             return
 
-        self.log(f"\n[详情获取] 使用 {self.args.threads} 个线程获取视频详情...")
-
-        self.db.update_task(self.task_id, total_videos=len(new_ids))
-
-        with ThreadPoolExecutor(max_workers=self.args.threads) as executor:
-            futures = {executor.submit(self.fetch_video_detail, av_id): av_id for av_id in new_ids}
-
-            for i, future in enumerate(as_completed(futures), 1):
-                av_id = futures[future]
-                try:
-                    result_av_id, detail, error = future.result()
-                    if detail:
-                        self.db.insert_video(self.task_id, detail)
-                        with self.stats_lock:
-                            self.success_count += 1
-                        self.log(f"  [{i}/{len(new_ids)}] av{av_id} ✓")
-                    else:
-                        with self.stats_lock:
-                            self.fail_count += 1
-                        error_type = "detail_fetch_failed"
-                        error_msg = error or "未知错误"
-                        self.db.insert_failed_video(self.task_id, av_id, error_type, error_msg)
-                        self.log(f"  [{i}/{len(new_ids)}] av{av_id} ✗ ({error_msg})")
-                except Exception as e:
-                    with self.stats_lock:
-                        self.fail_count += 1
-                    self.db.insert_failed_video(self.task_id, av_id, "exception", str(e)[:100])
-                    self.log(f"  [{i}/{len(new_ids)}] av{av_id} ✗ (异常: {e})")
-
-        self.db.update_task(
-            self.task_id,
-            status="completed",
-            success_count=self.success_count,
-            fail_count=self.fail_count,
-            completed_at=datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        )
-
-        self.log(f"\n[完成] 成功: {self.success_count}, 失败: {self.fail_count}")
-
+        self._fetch_and_insert_details(new_ids, "搜索")
         self._print_top_videos()
 
     def _print_top_videos(self, limit=10):
@@ -937,6 +1048,11 @@ class BiliSpider:
 
         self.log(f"\n[导出] 动量分析结果已保存到 {output_file}")
 
+    def analyze_popular_momentum(self):
+        """全站热门模式的动量分析"""
+        self.args.keyword = "全站热门"
+        self.analyze_momentum()
+
     def _print_tag_ranking(self, ranking, keyword):
         """
         标签权重算法:
@@ -1011,6 +1127,7 @@ def main():
   python momentum_spider.py -k 穷人 -p 5              # 爬取+补粉丝+动量分析+导出
   python momentum_spider.py -k 穷人 -p 10 -t 5        # 10页5线程
   python momentum_spider.py -k 穷人 --export-only      # 仅导出原始CSV
+  python momentum_spider.py --popular -p 10            # 全站热门模式，爬取10页热门视频
         """
     )
 
@@ -1027,6 +1144,8 @@ def main():
                         help="请求间隔秒数 (默认: 1.0)")
     parser.add_argument("--export-only", action="store_true",
                         help="仅导出原始CSV，不爬取")
+    parser.add_argument("--popular", action="store_true",
+                        help="全站热门模式：通过热门API爬取全站热门视频（无需关键词）")
 
     args = parser.parse_args()
 
@@ -1036,6 +1155,12 @@ def main():
         if args.export_only:
             print(f"[导出模式] 仅导出 {args.keyword} 的数据")
             spider.export_csv(args.keyword)
+        elif args.popular:
+            spider.run_popular()
+            spider.fix_comment_count_from_review()
+            spider.enrich_videos_with_fans()
+            spider.enrich_videos_with_tags("全站热门")
+            spider.analyze_popular_momentum()
         else:
             spider.run()
             spider.fix_comment_count_from_review()

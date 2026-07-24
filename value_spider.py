@@ -60,6 +60,25 @@ class ValueSpider:
         # Step 4: 价值评分
         self.analyze_value(keyword)
 
+    def run_popular(self):
+        """全站热门模式: 爬取热门 → 补粉丝 → 补标签 → 价值评分 → 展示 → 导出CSV"""
+        keyword = "全站热门"
+
+        # Step 1: 爬取热门数据
+        self.spider.run_popular()
+
+        # Step 2: 修复评论数
+        self.spider.fix_comment_count_from_review()
+
+        # Step 3: 补充粉丝数
+        self.spider.enrich_videos_with_fans()
+
+        # Step 4: 补充标签
+        self.spider.enrich_videos_with_tags(keyword)
+
+        # Step 5: 价值评分
+        self.analyze_value(keyword)
+
     def analyze_value(self, keyword):
         """对该关键词下的所有视频做价值评分"""
         # 查询该关键词下的所有视频（不限 task_id，爬多少算多少）
@@ -372,12 +391,17 @@ def main():
                         help="请求间隔秒数 (默认: 1.0)")
     parser.add_argument("--limit", "-l", type=int, default=999999,
                         help="显示数量 (默认: 全部)")
+    parser.add_argument("--popular", action="store_true",
+                        help="全站热门模式：通过热门API爬取全站热门视频（无需关键词）")
 
     args = parser.parse_args()
 
     spider = ValueSpider(args)
     try:
-        spider.run()
+        if args.popular:
+            spider.run_popular()
+        else:
+            spider.run()
     except KeyboardInterrupt:
         print("\n[中断] 用户手动停止")
         spider.db.update_task(spider.spider.task_id, status="failed", error_msg="用户中断")
