@@ -85,10 +85,23 @@ class CookieManager:
 
 class Database:
     def __init__(self, db_file):
-        self.conn = sqlite3.connect(db_file)
-        self.conn.execute("PRAGMA journal_mode=WAL")
-        self.conn.execute("PRAGMA busy_timeout=5000")
+        self._local = threading.local()
+        self._db_file = db_file
+        self._init_conn()
         self.create_tables()
+
+    @property
+    def conn(self):
+        if not hasattr(self._local, 'conn') or self._local.conn is None:
+            self._local.conn = sqlite3.connect(self._db_file)
+            self._local.conn.execute("PRAGMA journal_mode=WAL")
+            self._local.conn.execute("PRAGMA busy_timeout=5000")
+        return self._local.conn
+
+    def _init_conn(self):
+        self._local.conn = sqlite3.connect(self._db_file)
+        self._local.conn.execute("PRAGMA journal_mode=WAL")
+        self._local.conn.execute("PRAGMA busy_timeout=5000")
 
     def create_tables(self):
         cursor = self.conn.cursor()
@@ -220,6 +233,52 @@ class Database:
             cursor.execute("ALTER TABLE bili_videos ADD COLUMN time_span_hours REAL DEFAULT 0")
             print("[数据库] 已添加 time_span_hours 字段")
 
+        if "video_age_hours" not in video_columns:
+            cursor.execute("ALTER TABLE bili_videos ADD COLUMN video_age_hours REAL DEFAULT 0")
+            print("[数据库] 已添加 video_age_hours 字段")
+
+        if "engagement_score" not in video_columns:
+            cursor.execute("ALTER TABLE bili_videos ADD COLUMN engagement_score REAL DEFAULT 0")
+            print("[数据库] 已添加 engagement_score 字段")
+
+        # 回填旧数据的 video_age_hours 和 play_velocity
+        if "video_age_hours" in video_columns:
+            try:
+                cursor.execute("""
+                    UPDATE bili_videos 
+                    SET video_age_hours = ROUND((julianday('now') - julianday(pubdate)) * 24, 2)
+                    WHERE pubdate IS NOT NULL 
+                      AND pubdate != '' 
+                      AND (video_age_hours IS NULL OR video_age_hours = 0)
+                """)
+                backfilled = cursor.rowcount
+                if backfilled > 0:
+                    cursor.execute("""
+                        UPDATE bili_videos 
+                        SET play_velocity = ROUND(play_nums / video_age_hours, 2)
+                        WHERE video_age_hours > 0 AND (play_velocity IS NULL OR play_velocity = 0)
+                    """)
+                    print(f"[数据库] 已回填 {backfilled} 条视频的 video_age_hours 和 play_velocity")
+            except:
+                pass
+
+        # 回填旧数据的 engagement_score
+        if "engagement_score" in video_columns:
+            try:
+                cursor.execute("""
+                    UPDATE bili_videos 
+                    SET engagement_score = ROUND(
+                        CAST(COALESCE(like_count, 0) + COALESCE(coin, 0) + COALESCE(favorites, 0) 
+                             + COALESCE(review, 0) + COALESCE(danmakus, 0) AS FLOAT) 
+                        / MAX(play_nums, 1), 4)
+                    WHERE (engagement_score IS NULL OR engagement_score = 0)
+                      AND play_nums > 0
+                """)
+                if cursor.rowcount > 0:
+                    print(f"[数据库] 已回填 {cursor.rowcount} 条视频的 engagement_score")
+            except:
+                pass
+
     def create_task(self, keyword, pages, order_by):
         cursor = self.conn.cursor()
         now = datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
@@ -234,10 +293,13 @@ class Database:
         cursor = self.conn.cursor()
         updates = []
         params = []
+        has_completed_at = False
         for key, value in kwargs.items():
+            if key == "completed_at":
+                has_completed_at = True
             updates.append(f"{key} = ?")
             params.append(value)
-        if "completed_at" in kwargs or "status" in kwargs:
+        if not has_completed_at and ("completed_at" in kwargs or "status" in kwargs):
             updates.append("completed_at = ?")
             params.append(datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3])
         params.append(task_id)
@@ -248,12 +310,40 @@ class Database:
         cursor = self.conn.cursor()
         now = datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
         cursor.execute("""
-            INSERT OR REPLACE INTO bili_videos 
+            INSERT INTO bili_videos 
             (task_id, av_id, bvid, title, url, play_nums, danmakus, favorites, 
              review, coin, share, like_count, uploader, uploader_uid, uploader_fans,
              pubdate, duration, description, tags, category, fetched_at,
-             first_comment_time, comment_count, play_velocity, time_span_hours)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+             first_comment_time, comment_count, play_velocity, time_span_hours,
+             video_age_hours, engagement_score)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(av_id) DO UPDATE SET
+                task_id = excluded.task_id,
+                bvid = excluded.bvid,
+                title = excluded.title,
+                url = excluded.url,
+                play_nums = excluded.play_nums,
+                danmakus = excluded.danmakus,
+                favorites = excluded.favorites,
+                review = excluded.review,
+                coin = excluded.coin,
+                share = excluded.share,
+                like_count = excluded.like_count,
+                uploader = excluded.uploader,
+                uploader_uid = excluded.uploader_uid,
+                uploader_fans = excluded.uploader_fans,
+                pubdate = excluded.pubdate,
+                duration = excluded.duration,
+                description = excluded.description,
+                tags = excluded.tags,
+                category = excluded.category,
+                fetched_at = excluded.fetched_at,
+                first_comment_time = excluded.first_comment_time,
+                comment_count = excluded.comment_count,
+                play_velocity = excluded.play_velocity,
+                time_span_hours = excluded.time_span_hours,
+                video_age_hours = excluded.video_age_hours,
+                engagement_score = excluded.engagement_score
         """, (
             task_id,
             video_data.get("av_id"),
@@ -280,6 +370,8 @@ class Database:
             video_data.get("comment_count", 0),
             video_data.get("play_velocity", 0),
             video_data.get("time_span_hours", 0),
+            video_data.get("video_age_hours", 0),
+            video_data.get("engagement_score", 0),
         ))
 
         cursor.execute("""
@@ -310,9 +402,15 @@ class Database:
         cursor = self.conn.cursor()
         now = datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
         cursor.execute("""
-            INSERT OR REPLACE INTO bili_uploaders 
+            INSERT INTO bili_uploaders 
             (uid, name, fans, level, verified, fetched_at)
             VALUES (?, ?, ?, ?, ?, ?)
+            ON CONFLICT(uid) DO UPDATE SET
+                name = excluded.name,
+                fans = excluded.fans,
+                level = excluded.level,
+                verified = excluded.verified,
+                fetched_at = excluded.fetched_at
         """, (
             uid,
             video_data.get("uploader"),
@@ -520,10 +618,23 @@ class Database:
             return 0.8
 
     def get_keyword_momentum_ranking(self, keyword, metric="play_nums", limit=20):
+        """
+        单次快照动量排名：无需历史数据，一次爬取即可分析。
+        
+        评分维度（全部归一化到 0~1）：
+          - velocity_score  (30%): 播放速率 = 播放量 / 视频年龄(小时)
+          - conversion_score (25%): 粉丝转化率 = 播放量 / UP主粉丝数
+          - engagement_score (20%): 互动密度 = (点赞+投币+收藏+评论+弹幕) / 播放量
+          - freshness_weight (15%): 新鲜度权重（基于视频年龄的分段函数）
+          - normalized_value (10%): 当前播放量归一化
+        
+        当有历史数据时，额外显示真实增长率作为参考。
+        """
         cursor = self.conn.cursor()
         cursor.execute("""
             SELECT v.av_id, v.title, v.play_nums, v.pubdate, v.uploader_uid, v.uploader_fans,
-                   v.play_velocity, v.time_span_hours, v.comment_count, v.first_comment_time
+                   v.play_velocity, v.video_age_hours, v.engagement_score,
+                   v.comment_count, v.like_count, v.coin, v.share, v.danmakus, v.review
             FROM bili_videos v
             JOIN spider_tasks t ON v.task_id = t.id
             WHERE t.keyword = ?
@@ -531,113 +642,116 @@ class Database:
         """, (keyword,))
         videos = cursor.fetchall()
 
-        cursor2 = self.conn.cursor()
-        cursor2.execute("""
-            SELECT MAX(play_nums) as max_plays, MIN(play_nums) as min_plays,
-                   MAX(CAST(play_nums AS FLOAT) / CASE WHEN uploader_fans > 0 THEN uploader_fans ELSE 1 END) as max_conversion,
-                   MIN(CAST(play_nums AS FLOAT) / CASE WHEN uploader_fans > 0 THEN uploader_fans ELSE 1 END) as min_conversion,
-                   MAX(play_velocity) as max_velocity, MIN(play_velocity) as min_velocity
-            FROM bili_videos v
-            JOIN spider_tasks t ON v.task_id = t.id
-            WHERE t.keyword = ? AND uploader_fans > 0
-        """, (keyword,))
-        max_min = cursor2.fetchone()
-        max_plays = max_min[0] or 1
-        min_plays = max_min[1] or 0
-        max_conversion = max_min[2] or 1
-        min_conversion = max_min[3] or 0
-        max_velocity = max_min[4] or 1
-        min_velocity = max_min[5] or 0
+        if not videos:
+            return []
 
-        cursor3 = self.conn.cursor()
-        cursor3.execute("""
-            SELECT MAX(play_velocity) as max_velocity_all
-            FROM bili_videos v
-            JOIN spider_tasks t ON v.task_id = t.id
-            WHERE t.keyword = ? AND play_velocity > 0
-        """, (keyword,))
-        max_velocity_row = cursor3.fetchone()
-        max_velocity_all = max_velocity_row[0] or 1
+        # 计算归一化所需的极值
+        velocities = [v[6] for v in videos if v[6] and v[6] > 0]
+        max_velocity = max(velocities) if velocities else 1
+
+        conversions = []
+        for v in videos:
+            fans = v[5] or 0
+            if fans > 0:
+                conversions.append((v[2] or 0) / fans)
+        max_conversion = max(conversions) if conversions else 1
+
+        engagements = [v[8] for v in videos if v[8] and v[8] > 0]
+        max_engagement = max(engagements) if engagements else 1
+
+        plays = [v[2] for v in videos if v[2]]
+        max_plays = max(plays) if plays else 1
+        min_plays = min(plays) if plays else 0
 
         results = []
         for video in videos:
-            av_id, title, current_plays, pubdate, uploader_uid, uploader_fans, play_velocity, video_time_span, comment_count, first_comment_time = video
-            momentum = self.calculate_momentum(av_id, [metric], pubdate)
+            (av_id, title, current_plays, pubdate, uploader_uid, uploader_fans,
+             play_velocity, video_age_hours, engagement_raw,
+             comment_count, like_count, coin, share, danmakus, review) = video
 
+            current_plays = current_plays or 0
+            uploader_fans = uploader_fans or 0
+            play_velocity = play_velocity or 0
+            video_age_hours = video_age_hours or 0
+            engagement_raw = engagement_raw or 0
+
+            # 1. 播放速率得分
+            velocity_score = min(play_velocity / max_velocity, 1.0) if max_velocity > 0 else 0
+
+            # 2. 粉丝转化率得分
             conversion_rate = 0
-            if uploader_fans and uploader_fans > 0:
-                conversion_rate = (current_plays or 0) / uploader_fans
+            if uploader_fans > 0:
+                conversion_rate = current_plays / uploader_fans
+            conversion_score = min(conversion_rate / max_conversion, 1.0) if max_conversion > 0 and conversion_rate > 0 else 0
+
+            # 3. 互动密度得分
+            engagement_score = min(engagement_raw / max_engagement, 1.0) if max_engagement > 0 else 0
+
+            # 4. 新鲜度权重（基于 video_age_hours）
+            video_age_days = video_age_hours / 24 if video_age_hours > 0 else None
+            freshness = self.calculate_freshness_weight(video_age_days)
+            # 归一化到 0~1 范围（原始范围 0.8~2.0）
+            freshness_normalized = (freshness - 0.8) / (2.0 - 0.8)
+
+            # 5. 当前值归一化
+            normalized_value = (current_plays - min_plays) / (max_plays - min_plays) if max_plays > min_plays else 0.5
+
+            # 综合评分
+            composite_score = (
+                velocity_score * 0.30 +
+                conversion_score * 0.25 +
+                engagement_score * 0.20 +
+                freshness_normalized * 0.15 +
+                normalized_value * 0.10
+            )
+
+            # 尝试获取历史增长数据（可选增强）
+            historical_growth = None
+            data_points = 1
+            try:
+                h_cursor = self.conn.cursor()
+                h_cursor.execute("""
+                    SELECT COUNT(*) FROM video_history WHERE av_id = ?
+                """, (av_id,))
+                data_points = h_cursor.fetchone()[0] or 1
+                if data_points >= 2:
+                    h_cursor.execute("""
+                        SELECT play_nums FROM video_history WHERE av_id = ? ORDER BY record_time ASC
+                    """, (av_id,))
+                    history = [r[0] for r in h_cursor.fetchall()]
+                    if history and history[0] > 0:
+                        historical_growth = round((history[-1] - history[0]) / history[0] * 100, 2)
+            except:
+                pass
 
             video_info = {
                 "av_id": av_id,
                 "title": title,
-                "current_value": current_plays or 0,
+                "current_value": current_plays,
                 "pubdate": pubdate,
                 "uploader_uid": uploader_uid,
-                "uploader_fans": uploader_fans or 0,
+                "uploader_fans": uploader_fans,
                 "conversion_rate": round(conversion_rate, 2),
-                "play_velocity": play_velocity or 0,
+                "play_velocity": round(play_velocity, 2),
+                "engagement_score": round(engagement_raw, 4),
+                "video_age_hours": round(video_age_hours, 1),
                 "comment_count": comment_count or 0,
-                "time_span_hours": video_time_span or 0,
-                "first_comment_time": first_comment_time,
-                "status": momentum["status"],
-                "status_desc": momentum["status_desc"],
-                "data_points": momentum["data_points"],
-                "momentum_time_span": momentum["time_span_hours"],
-                "total_growth_pct": None,
+                "velocity_score": round(velocity_score, 4),
+                "conversion_score": round(conversion_score, 4),
+                "engagement_norm_score": round(engagement_score, 4),
+                "freshness_normalized": round(freshness_normalized, 4),
+                "normalized_value": round(normalized_value, 4),
+                "composite_score": round(composite_score, 4),
+                "data_points": data_points,
+                "historical_growth_pct": historical_growth,
+                # 兼容旧字段
+                "status": "snapshot",
+                "status_desc": "快照分析",
+                "total_growth_pct": historical_growth,
                 "cagr_daily_pct": None,
                 "avg_incremental_pct": None,
-                "freshness_weight": 1.0,
-                "normalized_value": 0,
-                "conversion_score": 0,
-                "velocity_score": 0,
-                "momentum_score": 0,
-                "composite_score": 0
+                "freshness_weight": freshness,
             }
-
-            if metric in momentum["metrics"]:
-                m = momentum["metrics"][metric]
-                video_info["total_growth_pct"] = m["total_growth_pct"]
-                video_info["cagr_daily_pct"] = m["cagr_daily_pct"]
-                video_info["avg_incremental_pct"] = m["avg_incremental_pct"]
-
-            video_age = momentum.get("video_age_days")
-            video_info["freshness_weight"] = self.calculate_freshness_weight(video_age)
-
-            if max_plays > min_plays:
-                video_info["normalized_value"] = (current_plays - min_plays) / (max_plays - min_plays)
-            else:
-                video_info["normalized_value"] = 0.5
-
-            if max_conversion > min_conversion and conversion_rate > 0:
-                video_info["conversion_score"] = min(conversion_rate / max(max_conversion, 1), 1.0)
-            else:
-                video_info["conversion_score"] = 0
-
-            if play_velocity and max_velocity_all > 0:
-                video_info["velocity_score"] = min(play_velocity / max_velocity_all, 1.0)
-            else:
-                video_info["velocity_score"] = 0
-
-            if momentum["status"] == "momentum_ready":
-                cagr = video_info["cagr_daily_pct"] or 0
-                momentum_score = min(max(cagr + 100, 0), 500) / 500
-                video_info["momentum_score"] = momentum_score
-                video_info["composite_score"] = (
-                    video_info["normalized_value"] * 0.25 +
-                    momentum_score * 0.20 +
-                    video_info["conversion_score"] * 0.20 +
-                    video_info["velocity_score"] * 0.20 +
-                    video_info["freshness_weight"] * 0.15
-                )
-            else:
-                video_info["momentum_score"] = 0
-                video_info["composite_score"] = (
-                    video_info["normalized_value"] * 0.35 +
-                    video_info["conversion_score"] * 0.25 +
-                    video_info["velocity_score"] * 0.25 +
-                    video_info["freshness_weight"] * 0.15
-                )
 
             results.append(video_info)
 
@@ -645,7 +759,9 @@ class Database:
         return results[:limit]
 
     def close(self):
-        self.conn.close()
+        if hasattr(self._local, 'conn') and self._local.conn:
+            self._local.conn.close()
+            self._local.conn = None
 
 
 class BiliSpider:
@@ -681,7 +797,7 @@ class BiliSpider:
         return functools.reduce(lambda s, i: s + orig[i], MIXIN_KEY_ENC_TAB, '')[:32]
 
     def _get_wbi_keys(self, headers):
-        url = "https://api.bilibili.com/x/web-interface/wbi/index/nav"
+        url = "https://api.bilibili.com/x/web-interface/nav"
         try:
             resp = requests.get(url, headers=headers, timeout=10, verify=False)
             data = resp.json()
@@ -770,6 +886,7 @@ class BiliSpider:
         return None
 
     def get_video_detail(self, av_id, max_retries=3):
+        """获取视频详情，返回 (detail_dict, error_str)，detail_dict 为 None 表示失败"""
         last_error = None
 
         for attempt in range(max_retries):
@@ -795,8 +912,7 @@ class BiliSpider:
 
                 if data["code"] == -404:
                     last_error = "视频不存在(-404)"
-                    self._last_error = last_error
-                    return None
+                    return None, last_error
 
                 if data["code"] != 0:
                     msg = data.get("message", "未知错误")
@@ -804,8 +920,7 @@ class BiliSpider:
                     if "频率" in msg or "风控" in msg:
                         time.sleep(random.uniform(3, 6))
                         continue
-                    self._last_error = last_error
-                    return None
+                    return None, last_error
 
                 video_data = data["data"]
                 stat = video_data["stat"]
@@ -823,7 +938,23 @@ class BiliSpider:
                 if video_data.get("tags"):
                     tags = [t.get("tag_name", "") for t in video_data.get("tags", [])]
 
-                self._last_error = None
+                # 用发布时间计算视频年龄和播放速率（单次爬取即可用）
+                pubdate_ts = video_data.get("pubdate", 0)
+                pubdate_str = datetime.fromtimestamp(pubdate_ts).strftime("%Y-%m-%d %H:%M:%S") if pubdate_ts else None
+                video_age_hours = 0
+                play_velocity = 0
+                if pubdate_ts > 0:
+                    video_age_hours = max((time.time() - pubdate_ts) / 3600, 0.1)
+                    play_nums = stat.get("view", 0)
+                    play_velocity = round(play_nums / video_age_hours, 2)
+
+                # 互动密度：(点赞+投币+收藏+评论+弹幕) / 播放量
+                total_interactions = (stat.get("like", 0) + stat.get("coin", 0) + 
+                                     stat.get("favorite", 0) + stat.get("reply", 0) + 
+                                     stat.get("danmaku", 0))
+                play_nums_for_engagement = stat.get("view", 1)
+                engagement_score = round(total_interactions / max(play_nums_for_engagement, 1), 4)
+
                 return {
                     "av_id": str(av_id),
                     "bvid": video_data.get("bvid"),
@@ -841,23 +972,24 @@ class BiliSpider:
                     "uploader_fans": uploader_fans,
                     "uploader_level": uploader_level,
                     "uploader_verified": uploader_verified,
-                    "pubdate": datetime.fromtimestamp(video_data.get("pubdate", 0)).strftime("%Y-%m-%d %H:%M:%S") if video_data.get("pubdate") else None,
+                    "pubdate": pubdate_str,
                     "duration": video_data.get("duration", 0),
                     "description": video_data.get("desc", ""),
                     "tags": ",".join(tags) if tags else None,
                     "category": video_data.get("tname", ""),
-                }
+                    "video_age_hours": round(video_age_hours, 2),
+                    "play_velocity": play_velocity,
+                    "engagement_score": engagement_score,
+                }, None
 
             except requests.RequestException as e:
                 last_error = f"请求异常: {str(e)[:50]}"
                 if attempt < max_retries - 1:
                     time.sleep(random.uniform(1, 3))
                 else:
-                    self._last_error = last_error
-                    return None
+                    return None, last_error
 
-        self._last_error = last_error or "超过最大重试次数"
-        return None
+        return None, last_error or "超过最大重试次数"
 
     def _fetch_uploader_fans(self, uid, headers, max_retries=2):
         try:
@@ -892,20 +1024,15 @@ class BiliSpider:
 
     def _fetch_uploader_fans_via_api(self, uid, headers):
         try:
-            params = {
-                "mid": int(uid),
-                "photo": "false",
-                "platform": "web",
-            }
-            signed_params = self.get_wbi_signed_params(params, headers)
-            api_url = f"https://api.bilibili.com/x/wbi/space/acc/info?{urlencode(signed_params)}"
+            params = {"mid": int(uid)}
+            api_url = f"https://api.bilibili.com/x/web-interface/card?{urlencode(params)}"
             resp = requests.get(api_url, headers=headers, timeout=10, verify=False)
             if resp.status_code == 200:
                 data = resp.json()
                 if data.get("code") == 0:
-                    info = data.get("data", {})
-                    fans = info.get("fans", 0)
-                    name = info.get("name", "")
+                    card = data.get("data", {}).get("card", {})
+                    fans = card.get("fans", 0)
+                    name = card.get("name", "")
                     if fans > 0:
                         self._update_uploader_fans(uid, fans, name)
                         return fans
@@ -935,9 +1062,18 @@ class BiliSpider:
 
     def fetch_video_detail(self, av_id):
         time.sleep(random.uniform(0.5, self.args.delay))
-        self._last_error = None
-        detail = self.get_video_detail(av_id)
-        error = self._last_error
+        detail, error = self.get_video_detail(av_id)
+        
+        # 同时获取评论数据
+        if detail:
+            comment_data = self.fetch_video_comments(
+                av_id, 
+                detail.get("play_nums", 0), 
+                detail.get("pubdate")
+            )
+            if comment_data:
+                detail.update(comment_data)
+        
         return av_id, detail, error
 
     def fetch_video_comments(self, av_id, play_nums, pubdate=None, max_retries=3):
@@ -1223,12 +1359,12 @@ class BiliSpider:
         metric = self.args.momentum_metric
         limit = self.args.momentum_limit
         
-        self.log(f"\n{'=' * 80}")
-        self.log(f"  动量分析 (增强版)")
-        self.log(f"{'=' * 80}")
+        self.log(f"\n{'=' * 90}")
+        self.log(f"  动量分析 (单次快照模式)")
+        self.log(f"{'=' * 90}")
         self.log(f"关键词: {keyword}")
-        self.log(f"指标: {metric}")
         self.log(f"显示数量: {limit}")
+        self.log(f"评分维度: 播放速率(30%) + 粉丝转化(25%) + 互动密度(20%) + 新鲜度(15%) + 播放量(10%)")
         self.log("")
 
         ranking = self.db.get_keyword_momentum_ranking(keyword, metric, limit)
@@ -1237,36 +1373,34 @@ class BiliSpider:
             self.log("[动量分析] 无数据可分析")
             return
 
-        metric_names = {
-            "play_nums": "播放量",
-            "danmakus": "弹幕数",
-            "favorites": "收藏数",
-            "review": "评论数",
-            "like_count": "点赞数"
-        }
-        metric_name = metric_names.get(metric, metric)
-
         self.log(f"\n动量排行 Top {limit}（按综合评分排序）")
-        self.log("-" * 170)
-        header = f"{'排名':<4} {'标题':<30} {'当前' + metric_name:>10} {'UP主':<12} {'粉丝数':>8} {'转化率':>8} {'播放速率':>10} {'评论数':>8} {'总增长%':>8} {'日均%':>8} {'状态':<10}"
+        self.log("-" * 180)
+        header = (f"{'排名':<4} {'标题':<28} {'播放量':>10} {'UP主':<10} {'粉丝':>8} "
+                  f"{'转化':>7} {'速率/h':>9} {'互动密度':>8} {'视频年龄':>8} {'历史增长':>8} {'综合分':>7}")
         self.log(header)
-        self.log("-" * 170)
+        self.log("-" * 180)
 
         for i, item in enumerate(ranking, 1):
-            title = item["title"][:28] if item["title"] else "未知"
+            title = (item["title"] or "未知")[:26]
             current = f"{item['current_value']:,}" if item['current_value'] else "-"
-            uploader = item.get('uploader_uid', '未知')[:11]
+            uploader = (item.get('uploader_uid') or '未知')[:9]
             fans = f"{item['uploader_fans']:,}" if item.get('uploader_fans') else "-"
-            conv_rate = f"{item['conversion_rate']:.1f}x" if item.get('conversion_rate', 0) > 0 else "-"
-            velocity = f"{item['play_velocity']:.1f}/h" if item.get('play_velocity', 0) > 0 else "-"
-            comments = f"{item['comment_count']:,}" if item.get('comment_count', 0) > 0 else "-"
-            total_growth = f"{item['total_growth_pct']:.1f}%" if item.get('total_growth_pct') is not None else "N/A"
-            cagr = f"{item['cagr_daily_pct']:.2f}%" if item.get('cagr_daily_pct') is not None else "N/A"
-            status = item.get('status_desc', '')[:8]
+            conv = f"{item['conversion_rate']:.1f}x" if item.get('conversion_rate', 0) > 0 else "-"
+            velocity = f"{item['play_velocity']:.0f}" if item.get('play_velocity', 0) > 0 else "-"
+            engagement = f"{item['engagement_score']:.3f}" if item.get('engagement_score', 0) > 0 else "-"
+            age_hours = item.get('video_age_hours', 0)
+            if age_hours >= 24:
+                age_str = f"{age_hours/24:.0f}天"
+            else:
+                age_str = f"{age_hours:.0f}h"
+            growth = f"{item['historical_growth_pct']:.1f}%" if item.get('historical_growth_pct') is not None else "N/A"
+            score = f"{item['composite_score']:.3f}"
             
-            self.log(f"{i:<4} {title:<30} {current:>10} {uploader:<12} {fans:>8} {conv_rate:>8} {velocity:>10} {comments:>8} {total_growth:>8} {cagr:>8} {status:<10}")
+            self.log(f"{i:<4} {title:<28} {current:>10} {uploader:<10} {fans:>8} {conv:>7} {velocity:>9} {engagement:>8} {age_str:>8} {growth:>8} {score:>7}")
 
-        self.log("-" * 170)
+        self.log("-" * 180)
+        self.log("\n提示: 综合分 = 播放速率(30%) + 粉丝转化(25%) + 互动密度(20%) + 新鲜度(15%) + 播放量(10%)")
+        self.log("      历史增长列显示多次爬取后的真实增长率，首次爬取为 N/A")
 
         if self.args.export_momentum:
             self._export_momentum_csv(ranking, keyword, metric)
@@ -1282,10 +1416,10 @@ class BiliSpider:
         with open(output_file, "w", newline="", encoding="utf-8-sig") as f:
             writer = csv.writer(f)
             writer.writerow([
-                "排名", "av_id", "标题", "当前值", "UP主UID", "粉丝数", "粉丝转化率",
-                "播放速率(次/小时)", "评论数", "时间跨度(小时)", "最早评论时间",
-                "总增长%", "日均增长%", "增量均值%", "数据点数量",
-                "发布时间", "状态", "综合评分"
+                "排名", "av_id", "标题", "播放量", "UP主UID", "粉丝数", "粉丝转化率",
+                "播放速率(次/小时)", "视频年龄(小时)", "互动密度", "评论数",
+                "速率得分", "转化得分", "互动得分", "新鲜度得分", "播放量得分",
+                "历史增长%", "数据点数量", "发布时间", "综合评分"
             ])
             for i, item in enumerate(ranking, 1):
                 writer.writerow([
@@ -1297,15 +1431,17 @@ class BiliSpider:
                     item.get("uploader_fans", 0),
                     item.get("conversion_rate", 0),
                     item.get("play_velocity", 0),
+                    item.get("video_age_hours", 0),
+                    item.get("engagement_score", 0),
                     item.get("comment_count", 0),
-                    item.get("time_span_hours", 0),
-                    item.get("first_comment_time", ""),
-                    item.get("total_growth_pct", "N/A"),
-                    item.get("cagr_daily_pct", "N/A"),
-                    item.get("avg_incremental_pct", "N/A"),
+                    item.get("velocity_score", 0),
+                    item.get("conversion_score", 0),
+                    item.get("engagement_norm_score", 0),
+                    item.get("freshness_normalized", 0),
+                    item.get("normalized_value", 0),
+                    item.get("historical_growth_pct", "N/A"),
                     item.get("data_points", 1),
                     item.get("pubdate", ""),
-                    item.get("status_desc", ""),
                     round(item.get("composite_score", 0), 4),
                 ])
 
@@ -1318,15 +1454,12 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 示例:
-  python bili_spider.py --keyword 服饰 --pages 10
-  python bili_spider.py --keyword 穿搭 --pages 5 --order pubdate -e
-  python bili_spider.py --keyword 美食 --pages 3 --threads 5
-  python bili_spider.py --keyword 服饰 --export-only  # 仅导出CSV
-  python bili_spider.py --keyword 服饰 --enrich-comments  # 补充评论和播放速率
-  python bili_spider.py --keyword 服饰 --enrich-comments --comments-limit 100  # 补充100条
-  python bili_spider.py --keyword 服饰 --momentum  # 动量分析
-  python bili_spider.py -k 服饰 -m --momentum-metric favorites  # 收藏动量
-  python bili_spider.py -k 服饰 -m --export-momentum  # 导出动量结果
+  python bili_spider.py -k 服饰 -p 10 -m              # 爬取并立即动量分析（单次即可）
+  python bili_spider.py -k 穿搭 -p 5 -m --export-momentum  # 爬取+分析+导出
+  python bili_spider.py -k 美食 -p 3 -t 5 -e          # 多线程爬取并导出CSV
+  python bili_spider.py -k 服饰 --export-only          # 仅导出CSV
+  python bili_spider.py -k 服饰 --momentum-only        # 仅对已有数据做动量分析
+  python bili_spider.py -k 服饰 --enrich-comments      # 补充评论数据（可选）
         """
     )
 
@@ -1350,7 +1483,9 @@ def main():
     parser.add_argument("--comments-limit", type=int, default=50,
                         help="补充评论数据的视频数量上限 (默认: 50)")
     parser.add_argument("--momentum", "-m", action="store_true",
-                        help="进行动量分析，评估视频增长趋势")
+                        help="爬取后立即进行动量分析（单次快照模式，无需历史数据）")
+    parser.add_argument("--momentum-only", action="store_true",
+                        help="不爬取，仅对数据库中已有数据做动量分析")
     parser.add_argument("--momentum-metric", type=str, default="play_nums",
                         choices=["play_nums", "danmakus", "favorites", "review", "like_count"],
                         help="动量分析指标 (默认: play_nums)")
@@ -1367,6 +1502,9 @@ def main():
         if args.export_only:
             print(f"[导出模式] 仅导出 {args.keyword} 的数据，不爬取")
             spider.export_csv(args.keyword)
+        elif args.momentum_only:
+            print(f"[动量分析模式] 仅分析数据库中已有数据")
+            spider.analyze_momentum()
         elif args.enrich_comments and not args.momentum:
             print(f"[评论补充模式] 补充评论数据和播放速率")
             spider.enrich_videos_with_comments(limit=args.comments_limit)
