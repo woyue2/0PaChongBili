@@ -701,7 +701,7 @@ class Database:
         cursor.execute("""
             SELECT v.av_id, v.title, v.play_nums, v.pubdate, v.uploader, v.uploader_uid, v.uploader_fans,
                    v.play_velocity, v.video_age_hours, v.engagement_score,
-                   v.comment_count, v.like_count, v.coin, v.share, v.danmakus, v.review
+                   v.comment_count, v.like_count, v.coin, v.share, v.danmakus, v.review, v.tags
             FROM bili_videos v
             JOIN spider_tasks t ON v.task_id = t.id
             WHERE t.keyword = ?
@@ -733,7 +733,7 @@ class Database:
         for video in videos:
             (av_id, title, current_plays, pubdate, uploader, uploader_uid, uploader_fans,
              play_velocity, video_age_hours, engagement_raw,
-             comment_count, like_count, coin, share, danmakus, review) = video
+             comment_count, like_count, coin, share, danmakus, review, tags_str) = video
 
             current_plays = int(current_plays or 0)
             uploader_fans = int(uploader_fans or 0)
@@ -805,6 +805,8 @@ class Database:
                 "cagr_daily_pct": None,
                 "avg_incremental_pct": None,
                 "freshness_weight": freshness,
+                "tags": tags_str or "",
+                "tag_list": [t.strip() for t in (tags_str or "").split(",") if t.strip()],
             }
             results.append(video_info)
 

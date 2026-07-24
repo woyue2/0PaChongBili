@@ -259,21 +259,34 @@ class ValueSpider:
         tag_weights.sort(key=lambda x: x["weight"], reverse=True)
         top10 = tag_weights[:10]
 
-        self.spider.log(f"\n{'=' * 80}")
-        self.spider.log(f"  标签权重 Top 10 (关键词: {keyword})")
-        self.spider.log(f"{'=' * 80}")
-        self.spider.log(f"总视频数: {total_videos} | 不同标签数: {len(tag_stats)}")
-        self.spider.log(f"算法: 标签权重 = 出现视频数 × 平均价值分")
-        self.spider.log(f"{'-' * 80}")
-        self.spider.log(f"{'排名':<4} {'标签':<20} {'出现次数':>8} {'覆盖率':>8} {'平均价值分':>10} {'标签权重':>10}")
-        self.spider.log(f"{'-' * 80}")
+        lines = []
+        lines.append(f"\n{'=' * 80}")
+        lines.append(f"  标签权重 Top 10 (关键词: {keyword})")
+        lines.append(f"{'=' * 80}")
+        lines.append(f"总视频数: {total_videos} | 不同标签数: {len(tag_stats)}")
+        lines.append(f"算法: 标签权重 = 出现视频数 × 平均价值分")
+        lines.append(f"{'-' * 80}")
+        lines.append(f"{'排名':<4} {'标签':<20} {'出现次数':>8} {'覆盖率':>8} {'平均价值分':>10} {'标签权重':>10}")
+        lines.append(f"{'-' * 80}")
         for i, tw in enumerate(top10, 1):
             tag_display = _safe_str(tw["tag"], 18)
-            self.spider.log(
+            lines.append(
                 f"{i:<4} {tag_display:<20} {tw['count']:>8} {tw['pct']:>7.1f}% {tw['avg_score']:>10.3f} {tw['weight']:>10.3f}"
             )
-        self.spider.log(f"{'-' * 80}")
-        self.spider.log("说明: 标签权重越高 = 该标签在高质量视频中出现越频繁，越值得重点关注")
+        lines.append(f"{'-' * 80}")
+        lines.append("说明: 标签权重越高 = 该标签在高质量视频中出现越频繁，越值得重点关注")
+
+        for line in lines:
+            self.spider.log(line)
+
+        # 保存到文件
+        output_dir = os.path.join("output", keyword)
+        os.makedirs(output_dir, exist_ok=True)
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        tag_file = os.path.join(output_dir, f"tags_{timestamp}.txt")
+        with open(tag_file, "w", encoding="utf-8") as f:
+            f.write("\n".join(lines))
+        self.spider.log(f"\n[导出] 标签分析已保存到 {tag_file}")
 
     def _export_csv(self, videos, keyword):
         """导出价值分析结果到 CSV"""

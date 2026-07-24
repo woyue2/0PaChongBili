@@ -890,6 +890,9 @@ class BiliSpider:
         # 动量分析后自动导出
         self._export_momentum_csv(ranking, keyword, metric)
 
+        # 标签权重分析
+        self._print_tag_ranking(ranking, keyword)
+
     def _export_momentum_csv(self, ranking, keyword, metric):
         output_dir = os.path.join("output", keyword)
         os.makedirs(output_dir, exist_ok=True)
@@ -902,7 +905,7 @@ class BiliSpider:
             writer = csv.writer(f)
             writer.writerow([
                 "排名", "av_id", "标题", "播放量", "UP主", "UP主UID", "粉丝数", "粉丝转化率",
-                "播放速率(次/小时)", "视频年龄(小时)", "互动密度", "评论数",
+                "播放速率(次/小时)", "视频年龄(小时)", "互动密度", "评论数", "标签",
                 "速率得分", "转化得分", "互动得分", "新鲜度得分", "播放量得分",
                 "历史增长%", "数据点数量", "发布时间", "综合评分"
             ])
@@ -920,6 +923,7 @@ class BiliSpider:
                     item.get("video_age_hours", 0),
                     item.get("engagement_score", 0),
                     item.get("comment_count", 0),
+                    item.get("tags", ""),
                     item.get("velocity_score", 0),
                     item.get("conversion_score", 0),
                     item.get("engagement_norm_score", 0),
@@ -932,6 +936,70 @@ class BiliSpider:
                 ])
 
         self.log(f"\n[导出] 动量分析结果已保存到 {output_file}")
+
+    def _print_tag_ranking(self, ranking, keyword):
+        """
+        标签权重算法:
+        对每个标签，统计含有该标签的视频数量（出现频次）和这些视频的平均动量分。
+        标签权重 = 出现频次 × 平均动量分
+        """
+        from collections import defaultdict
+
+        total_videos = len(ranking)
+        tag_stats = defaultdict(lambda: {"count": 0, "score_sum": 0.0})
+
+        for v in ranking:
+            for tag in v.get("tag_list", []):
+                tag_stats[tag]["count"] += 1
+                tag_stats[tag]["score_sum"] += v.get("composite_score", 0)
+
+        if not tag_stats:
+            self.log("\n[标签分析] 无标签数据")
+            return
+
+        tag_weights = []
+        for tag, stats in tag_stats.items():
+            avg_score = stats["score_sum"] / stats["count"]
+            weight = stats["count"] * avg_score
+            tag_weights.append({
+                "tag": tag,
+                "count": stats["count"],
+                "avg_score": avg_score,
+                "weight": weight,
+                "pct": stats["count"] / total_videos * 100,
+            })
+
+        tag_weights.sort(key=lambda x: x["weight"], reverse=True)
+        top10 = tag_weights[:10]
+
+        lines = []
+        lines.append(f"\n{'=' * 80}")
+        lines.append(f"  标签权重 Top 10 (关键词: {keyword})")
+        lines.append(f"{'=' * 80}")
+        lines.append(f"总视频数: {total_videos} | 不同标签数: {len(tag_stats)}")
+        lines.append(f"算法: 标签权重 = 出现视频数 × 平均动量分")
+        lines.append(f"{'-' * 80}")
+        lines.append(f"{'排名':<4} {'标签':<20} {'出现次数':>8} {'覆盖率':>8} {'平均动量分':>10} {'标签权重':>10}")
+        lines.append(f"{'-' * 80}")
+        for i, tw in enumerate(top10, 1):
+            tag_display = tw["tag"][:18]
+            lines.append(
+                f"{i:<4} {tag_display:<20} {tw['count']:>8} {tw['pct']:>7.1f}% {tw['avg_score']:>10.3f} {tw['weight']:>10.3f}"
+            )
+        lines.append(f"{'-' * 80}")
+        lines.append("说明: 标签权重越高 = 该标签在高动量视频中出现越频繁，越值得关注")
+
+        for line in lines:
+            self.log(line)
+
+        # 保存到文件
+        output_dir = os.path.join("output", keyword)
+        os.makedirs(output_dir, exist_ok=True)
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        tag_file = os.path.join(output_dir, f"tags_{timestamp}.txt")
+        with open(tag_file, "w", encoding="utf-8") as f:
+            f.write("\n".join(lines))
+        self.log(f"\n[导出] 标签分析已保存到 {tag_file}")
 
 
 def main():
