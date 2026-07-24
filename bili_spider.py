@@ -477,6 +477,46 @@ class Database:
         """, (keyword,))
         return set(row[0] for row in cursor.fetchall())
 
+    def get_uploaders_with_zero_fans(self, keyword=None):
+        """获取粉丝数为0的UP主UID列表（去重）"""
+        cursor = self.conn.cursor()
+        if keyword:
+            cursor.execute("""
+                SELECT DISTINCT v.uploader_uid, v.uploader
+                FROM bili_videos v
+                JOIN spider_tasks t ON v.task_id = t.id
+                WHERE t.keyword = ? AND v.uploader_uid IS NOT NULL AND v.uploader_uid != '' AND v.uploader_fans = 0
+            """, (keyword,))
+        else:
+            cursor.execute("""
+                SELECT DISTINCT uploader_uid, uploader
+                FROM bili_videos
+                WHERE uploader_uid IS NOT NULL AND uploader_uid != '' AND uploader_fans = 0
+            """
+            )
+        return cursor.fetchall()
+
+    def batch_update_uploader_fans(self, uid, fans, name=None):
+        """批量更新某UP主所有视频的粉丝数"""
+        cursor = self.conn.cursor()
+        now = datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
+        cursor.execute("""
+            UPDATE bili_videos SET uploader_fans = ?, fetched_at = ?
+            WHERE uploader_uid = ? AND uploader_fans = 0
+        """, (fans, now, uid))
+        updated = cursor.rowcount
+        # 同时更新 uploaders 表
+        if name:
+            cursor.execute("""
+                INSERT INTO bili_uploaders (uid, name, fans, fetched_at)
+                VALUES (?, ?, ?, ?)
+                ON CONFLICT(uid) DO UPDATE SET name=excluded.name, fans=excluded.fans, fetched_at=excluded.fetched_at
+            """, (uid, name, fans, now))
+        else:
+            cursor.execute("UPDATE bili_uploaders SET fans = ?, fetched_at = ? WHERE uid = ?", (fans, now, uid))
+        self.conn.commit()
+        return updated
+
     def get_task_stats(self, task_id):
         cursor = self.conn.cursor()
         cursor.execute("""
@@ -774,6 +814,9 @@ class BiliSpider:
         self.success_count = 0
         self.fail_count = 0
         self.search_fail_count = 0
+        self._pw = None
+        self._pw_browser = None
+        self._pw_lock = threading.Lock()
         self._init_logger()
 
     def _init_logger(self):
@@ -1023,6 +1066,31 @@ class BiliSpider:
         return 0
 
     def _fetch_uploader_fans_via_api(self, uid, headers):
+        """三级级联获取粉丝: card API → relation API → Playwright"""
+        # 第1级: card API
+        result = self._fans_via_card_api(uid, headers)
+        if result is not None:
+            return result
+        self.log(f"  [粉丝] UID={uid} card API失败，尝试 relation API")
+        time.sleep(random.uniform(0.3, 0.6))
+
+        # 第2级: relation API
+        result = self._fans_via_relation_api(uid, headers)
+        if result is not None:
+            return result
+        self.log(f"  [粉丝] UID={uid} relation API失败，尝试 Playwright")
+        time.sleep(random.uniform(0.5, 1.0))
+
+        # 第3级: Playwright 兜底
+        result = self._fans_via_playwright(uid)
+        if result is not None:
+            return result
+
+        self.log(f"  [粉丝] UID={uid} 三级回退全部失败")
+        return None
+
+    def _fans_via_card_api(self, uid, headers):
+        """第1级: card API 获取粉丝数"""
         try:
             params = {"mid": int(uid)}
             api_url = f"https://api.bilibili.com/x/web-interface/card?{urlencode(params)}"
@@ -1036,10 +1104,117 @@ class BiliSpider:
                     if fans > 0:
                         self._update_uploader_fans(uid, fans, name)
                         return fans
+                else:
+                    self.log(f"  [粉丝-card] UID={uid} code={data.get('code')} msg={data.get('message', '')[:60]}")
+            else:
+                self.log(f"  [粉丝-card] UID={uid} HTTP {resp.status_code}")
         except Exception as e:
-            self.log(f"  [粉丝获取失败] UID={uid}: {e}")
-
+            self.log(f"  [粉丝-card] UID={uid} 异常: {e}")
         return None
+
+    def _fans_via_relation_api(self, uid, headers):
+        """第2级: relation stat API 获取粉丝数"""
+        try:
+            api_url = f"https://api.bilibili.com/x/relation/stat?vmid={uid}"
+            resp = requests.get(api_url, headers=headers, timeout=10, verify=False)
+            if resp.status_code == 200:
+                data = resp.json()
+                if data.get("code") == 0:
+                    followers = data.get("data", {}).get("follower", 0)
+                    if followers > 0:
+                        self._update_uploader_fans(uid, followers)
+                        return followers
+                else:
+                    self.log(f"  [粉丝-relation] UID={uid} code={data.get('code')} msg={data.get('message', '')[:60]}")
+            else:
+                self.log(f"  [粉丝-relation] UID={uid} HTTP {resp.status_code}")
+        except Exception as e:
+            self.log(f"  [粉丝-relation] UID={uid} 异常: {e}")
+        return None
+
+    def _fans_via_playwright(self, uid):
+        """第3级: Playwright 浏览器兜底获取粉丝数"""
+        try:
+            from playwright.sync_api import sync_playwright
+        except ImportError:
+            self.log("  [粉丝-PW] playwright 未安装，跳过 (pip install playwright && python -m playwright install chromium)")
+            return None
+
+        with self._pw_lock:
+            try:
+                if self._pw is None:
+                    self._pw = sync_playwright().start()
+                    try:
+                        self._pw_browser = self._pw.chromium.launch(headless=True)
+                    except Exception:
+                        self._pw_browser = self._pw.chromium.launch(headless=True, channel="msedge")
+
+                context = self._pw_browser.new_context(
+                    user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+                    viewport={"width": 1280, "height": 720},
+                )
+                page = context.new_page()
+                page.goto(f"https://space.bilibili.com/{uid}", wait_until="domcontentloaded", timeout=15000)
+                page.wait_for_timeout(3000)
+
+                fans = 0
+                name = ""
+                try:
+                    # 方法1: 通过 title 属性获取精确粉丝数
+                    fan_link = page.query_selector(f'a[href="/{uid}/fans/fans"]')
+                    if fan_link:
+                        title_attr = fan_link.get_attribute("title")
+                        if title_attr:
+                            fans = int(''.join(filter(str.isdigit, title_attr)))
+                    # 方法2: 回退到文本解析
+                    if fans == 0:
+                        fan_text_el = page.query_selector(f'a[href="/{uid}/fans/fans"] .n-data-v')
+                        if fan_text_el:
+                            text = fan_text_el.inner_text().strip().replace(',', '').replace(' ', '')
+                            if '万' in text:
+                                fans = int(float(text.replace('万', '')) * 10000)
+                            else:
+                                fans = int(''.join(filter(str.isdigit, text)))
+                    # 获取UP主名称
+                    name_el = page.query_selector('#h-name, .h-name, .user-name')
+                    if name_el:
+                        name = name_el.inner_text().strip()
+                except Exception as e:
+                    self.log(f"  [粉丝-PW] UID={uid} 页面解析异常: {e}")
+
+                context.close()
+
+                if fans > 0:
+                    self.log(f"  [粉丝-PW] UID={uid} Playwright兜底成功: {fans:,}")
+                    self._update_uploader_fans(uid, fans, name or None)
+                    return fans
+                else:
+                    self.log(f"  [粉丝-PW] UID={uid} 页面未找到粉丝数")
+            except Exception as e:
+                self.log(f"  [粉丝-PW] UID={uid} 浏览器异常: {e}")
+                try:
+                    if self._pw_browser:
+                        self._pw_browser.close()
+                    if self._pw:
+                        self._pw.stop()
+                except:
+                    pass
+                self._pw = None
+                self._pw_browser = None
+        return None
+
+    def _close_playwright(self):
+        """关闭 Playwright 浏览器实例"""
+        with self._pw_lock:
+            try:
+                if self._pw_browser:
+                    self._pw_browser.close()
+                if self._pw:
+                    self._pw.stop()
+            except:
+                pass
+            self._pw = None
+            self._pw_browser = None
 
     def _update_uploader_fans(self, uid, fans, name=None):
         try:
@@ -1204,6 +1379,41 @@ class BiliSpider:
         
         self.log(f"\n[完成] 评论数据补充: 成功 {success}, 失败 {fail}")
 
+    def enrich_videos_with_fans(self, keyword=None):
+        """自动检测并补充粉丝数为0的UP主数据（三级回退）"""
+        self.log(f"\n{'='*60}")
+        self.log(f"  自动检测并补充粉丝数")
+        self.log(f"{'='*60}")
+
+        uploaders = self.db.get_uploaders_with_zero_fans(keyword)
+        self.log(f"待补充UP主数: {len(uploaders)}")
+
+        if not uploaders:
+            self.log("[完成] 所有UP主已有粉丝数据")
+            return
+
+        success = 0
+        fail = 0
+
+        for i, (uid, name) in enumerate(uploaders, 1):
+            if i % 10 == 0:
+                self.log(f"  进度: {i}/{len(uploaders)}")
+
+            headers = self.cookie_mgr.get_headers()
+            fans = self._fetch_uploader_fans_via_api(uid, headers)
+
+            if fans and fans > 0:
+                updated = self.db.batch_update_uploader_fans(uid, fans, name)
+                success += 1
+                self.log(f"  [{i}/{len(uploaders)}] UID={uid} ({name}) -> {fans:,} (更新{updated}条视频)")
+            else:
+                fail += 1
+                self.log(f"  [{i}/{len(uploaders)}] UID={uid} ({name}) -> 获取失败")
+
+            time.sleep(random.uniform(0.3, 0.8))
+
+        self.log(f"\n[完成] 粉丝数补充: 成功 {success}, 失败 {fail}")
+
     def run(self):
         self.log("=" * 60)
         self.log("  B站视频爬虫 (增强版)")
@@ -1356,8 +1566,8 @@ class BiliSpider:
 
     def analyze_momentum(self):
         keyword = self.args.keyword
-        metric = self.args.momentum_metric
-        limit = self.args.momentum_limit
+        metric = "play_nums"
+        limit = 999999  # 爬多少算多少
         
         self.log(f"\n{'=' * 90}")
         self.log(f"  动量分析 (单次快照模式)")
@@ -1402,8 +1612,8 @@ class BiliSpider:
         self.log("\n提示: 综合分 = 播放速率(30%) + 粉丝转化(25%) + 互动密度(20%) + 新鲜度(15%) + 播放量(10%)")
         self.log("      历史增长列显示多次爬取后的真实增长率，首次爬取为 N/A")
 
-        if self.args.export_momentum:
-            self._export_momentum_csv(ranking, keyword, metric)
+        # 动量分析后自动导出
+        self._export_momentum_csv(ranking, keyword, metric)
 
     def _export_momentum_csv(self, ranking, keyword, metric):
         output_dir = os.path.join("output", keyword)
@@ -1450,16 +1660,13 @@ class BiliSpider:
 
 def main():
     parser = argparse.ArgumentParser(
-        description="B站视频爬虫 - 支持关键词搜索、多线程获取、SQLite存储",
+        description="B站视频爬虫 - 动量分析版",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 示例:
-  python bili_spider.py -k 服饰 -p 10 -m              # 爬取并立即动量分析（单次即可）
-  python bili_spider.py -k 穿搭 -p 5 -m --export-momentum  # 爬取+分析+导出
-  python bili_spider.py -k 美食 -p 3 -t 5 -e          # 多线程爬取并导出CSV
-  python bili_spider.py -k 服饰 --export-only          # 仅导出CSV
-  python bili_spider.py -k 服饰 --momentum-only        # 仅对已有数据做动量分析
-  python bili_spider.py -k 服饰 --enrich-comments      # 补充评论数据（可选）
+  python bili_spider.py -k 穷人 -p 5              # 爬取+补粉丝+动量分析+导出
+  python bili_spider.py -k 穷人 -p 10 -t 5        # 10页5线程
+  python bili_spider.py -k 穷人 --export-only      # 仅导出原始CSV
         """
     )
 
@@ -1469,30 +1676,13 @@ def main():
                         help="爬取页数 (默认: 5)")
     parser.add_argument("--order", "-o", type=str, default="click",
                         choices=["click", "pubdate", "dm", "stow"],
-                        help="排序方式: click=播放量, pubdate=时间, dm=弹幕, stow=收藏 (默认: click)")
+                        help="排序方式 (默认: click)")
     parser.add_argument("--threads", "-t", type=int, default=3,
-                        help="线程数 (默认: 3, 建议 1-5)")
+                        help="线程数 (默认: 3)")
     parser.add_argument("--delay", "-d", type=float, default=1.0,
                         help="请求间隔秒数 (默认: 1.0)")
-    parser.add_argument("--export", "-e", action="store_true",
-                        help="完成后导出CSV文件")
     parser.add_argument("--export-only", action="store_true",
-                        help="仅从数据库导出CSV，不执行爬取")
-    parser.add_argument("--enrich-comments", action="store_true",
-                        help="补充评论数据和播放速率 (hourly_view_rate)")
-    parser.add_argument("--comments-limit", type=int, default=50,
-                        help="补充评论数据的视频数量上限 (默认: 50)")
-    parser.add_argument("--momentum", "-m", action="store_true",
-                        help="爬取后立即进行动量分析（单次快照模式，无需历史数据）")
-    parser.add_argument("--momentum-only", action="store_true",
-                        help="不爬取，仅对数据库中已有数据做动量分析")
-    parser.add_argument("--momentum-metric", type=str, default="play_nums",
-                        choices=["play_nums", "danmakus", "favorites", "review", "like_count"],
-                        help="动量分析指标 (默认: play_nums)")
-    parser.add_argument("--momentum-limit", type=int, default=20,
-                        help="动量分析显示数量 (默认: 20)")
-    parser.add_argument("--export-momentum", action="store_true",
-                        help="导出动量分析结果为CSV")
+                        help="仅导出原始CSV，不爬取")
 
     args = parser.parse_args()
 
@@ -1500,32 +1690,12 @@ def main():
 
     try:
         if args.export_only:
-            print(f"[导出模式] 仅导出 {args.keyword} 的数据，不爬取")
+            print(f"[导出模式] 仅导出 {args.keyword} 的数据")
             spider.export_csv(args.keyword)
-        elif args.momentum_only:
-            print(f"[动量分析模式] 仅分析数据库中已有数据")
-            spider.analyze_momentum()
-        elif args.enrich_comments and not args.momentum:
-            print(f"[评论补充模式] 补充评论数据和播放速率")
-            spider.enrich_videos_with_comments(limit=args.comments_limit)
         else:
             spider.run()
-            
-            if args.enrich_comments:
-                print(f"\n[评论补充] 补充评论数据和播放速率")
-                spider.enrich_videos_with_comments(limit=args.comments_limit)
-            
-            if args.export:
-                spider.export_csv()
-            
-            if args.momentum:
-                print(f"\n[动量分析] 开始动量分析")
-                spider.analyze_momentum()
-            
-            if args.export_momentum:
-                print(f"\n[导出动量] 导出动量分析结果")
-                ranking = spider.db.get_keyword_momentum_ranking(args.keyword, args.momentum_metric, args.momentum_limit)
-                spider._export_momentum_csv(ranking, args.keyword, args.momentum_metric)
+            spider.enrich_videos_with_fans(args.keyword)
+            spider.analyze_momentum()
     except KeyboardInterrupt:
         print("\n[中断] 用户手动停止")
         spider.db.update_task(spider.task_id, status="failed", error_msg="用户中断")
@@ -1534,6 +1704,7 @@ def main():
         if spider.task_id:
             spider.db.update_task(spider.task_id, status="failed", error_msg=str(e))
     finally:
+        spider._close_playwright()
         spider.db.close()
 
 
