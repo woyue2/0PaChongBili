@@ -6,15 +6,24 @@ import random
 import warnings
 import os
 import threading
+import hashlib
+import functools
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
-from urllib.parse import urlencode
+from urllib.parse import urlencode, parse_qs, unquote
 
 requests.packages.urllib3.disable_warnings()
 warnings.filterwarnings("ignore")
 
 DB_FILE = "bili_spider.db"
 COOKIE_FILE = "bili_cookie.txt"
+
+MIXIN_KEY_ENC_TAB = [
+    46, 47, 18, 2, 53, 8, 23, 32, 15, 50, 10, 31, 58, 3, 45, 35,
+    27, 43, 5, 49, 33, 9, 42, 19, 29, 28, 14, 39, 12, 38, 41, 13,
+    37, 48, 7, 16, 24, 55, 40, 61, 26, 17, 0, 1, 60, 51, 30, 4,
+    22, 25, 54, 21, 56, 59, 6, 63, 57, 62, 11, 36, 20, 34, 44, 52,
+]
 
 USER_AGENTS = [
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
@@ -28,6 +37,7 @@ USER_AGENTS = [
 class CookieManager:
     def __init__(self, cookie_file):
         self.cookies = []
+        self.full_cookies = []
         self.current_index = 0
         self.lock = threading.Lock()
         self.load_cookies(cookie_file)
@@ -38,16 +48,24 @@ class CookieManager:
                 for line in f:
                     line = line.strip()
                     if line and not line.startswith("#"):
-                        self.cookies.append(line)
-        print(f"[Cookie] 已加载 {len(self.cookies)} 个 Cookie")
+                        if "=" in line and "SESSDATA" in line:
+                            self.full_cookies.append(line)
+                        else:
+                            self.cookies.append(line)
+        total = len(self.cookies) + len(self.full_cookies)
+        print(f"[Cookie] 已加载 {total} 个 Cookie (SESSDATA: {len(self.full_cookies)}, 完整Cookie: {len(self.cookies)})")
 
     def get_cookie(self):
         with self.lock:
-            if not self.cookies:
-                return None
-            cookie = self.cookies[self.current_index]
-            self.current_index = (self.current_index + 1) % len(self.cookies)
-            return cookie
+            if self.full_cookies:
+                cookie = self.full_cookies[self.current_index % len(self.full_cookies)]
+                self.current_index += 1
+                return cookie
+            if self.cookies:
+                cookie = self.cookies[self.current_index]
+                self.current_index = (self.current_index + 1) % len(self.cookies)
+                return cookie
+            return None
 
     def get_headers(self, referer="https://www.bilibili.com/"):
         headers = {
@@ -58,7 +76,10 @@ class CookieManager:
         }
         cookie = self.get_cookie()
         if cookie:
-            headers["Cookie"] = f"SESSDATA={cookie}"
+            if "=" in cookie:
+                headers["Cookie"] = cookie
+            else:
+                headers["Cookie"] = f"SESSDATA={cookie}"
         return headers
 
 
@@ -656,6 +677,40 @@ class BiliSpider:
         except Exception:
             pass
 
+    def _get_mixin_key(self, orig):
+        return functools.reduce(lambda s, i: s + orig[i], MIXIN_KEY_ENC_TAB, '')[:32]
+
+    def _get_wbi_keys(self, headers):
+        url = "https://api.bilibili.com/x/web-interface/wbi/index/nav"
+        try:
+            resp = requests.get(url, headers=headers, timeout=10, verify=False)
+            data = resp.json()
+            if data.get("code") == 0:
+                img_key = data["data"]["wbi_img"]["img_url"].rsplit("/", 1)[1].split(".")[0]
+                sub_key = data["data"]["wbi_img"]["sub_url"].rsplit("/", 1)[1].split(".")[0]
+                return img_key, sub_key
+        except Exception as e:
+            self.log(f"  [WBI] 获取密钥失败: {e}")
+        return None, None
+
+    def get_wbi_signed_params(self, params, headers=None):
+        if headers is None:
+            headers = self.cookie_mgr.get_headers()
+        
+        img_key, sub_key = self._get_wbi_keys(headers)
+        if not img_key or not sub_key:
+            return params
+        
+        mixin_key = self._get_mixin_key(img_key + sub_key)
+        curr_time = round(time.time())
+        params['wts'] = curr_time
+        params = dict(sorted(params.items()))
+        params = {k: ''.join(filter(lambda c: c not in "!'()*", str(v))) for k, v in params.items()}
+        query = urlencode(params)
+        wbi_sign = hashlib.md5((query + mixin_key).encode()).hexdigest()
+        params['w_rid'] = wbi_sign
+        return params
+
     def search_page(self, keyword, page, order="click", max_retries=3):
         params = {
             "search_type": "video",
@@ -664,11 +719,12 @@ class BiliSpider:
             "order": order,
             "platform": "pc",
         }
-        url = f"https://api.bilibili.com/x/web-interface/search/type?{urlencode(params)}"
 
         for attempt in range(max_retries):
             headers = self.cookie_mgr.get_headers("https://search.bilibili.com/")
             try:
+                signed_params = self.get_wbi_signed_params(params.copy(), headers)
+                url = f"https://api.bilibili.com/x/web-interface/search/type?{urlencode(signed_params)}"
                 resp = requests.get(url, headers=headers, timeout=15, verify=False)
 
                 if resp.status_code == 412:
@@ -714,12 +770,14 @@ class BiliSpider:
         return None
 
     def get_video_detail(self, av_id, max_retries=3):
-        url = f"https://api.bilibili.com/x/web-interface/view?aid={av_id}"
         last_error = None
 
         for attempt in range(max_retries):
             headers = self.cookie_mgr.get_headers()
             try:
+                params = {"aid": int(av_id)}
+                signed_params = self.get_wbi_signed_params(params, headers)
+                url = f"https://api.bilibili.com/x/web-interface/view?{urlencode(signed_params)}"
                 resp = requests.get(url, headers=headers, timeout=15, verify=False)
 
                 if resp.status_code == 412:
@@ -833,59 +891,26 @@ class BiliSpider:
         return 0
 
     def _fetch_uploader_fans_via_api(self, uid, headers):
-        import hashlib
-        import functools
-        from urllib.parse import urlencode
-
-        MIXIN_KEY_ENC_TAB = [
-            46, 47, 18, 2, 53, 8, 23, 32, 15, 50, 10, 31, 58, 3, 45, 35,
-            27, 43, 5, 49, 33, 9, 42, 19, 29, 28, 14, 39, 12, 38, 41, 13,
-            37, 48, 7, 16, 24, 55, 40, 61, 26, 17, 0, 1, 60, 51, 30, 4,
-            22, 25, 54, 21, 56, 59, 6, 63, 57, 62, 11, 36, 20, 34, 44, 52,
-        ]
-
-        def get_mixin_key(orig):
-            return functools.reduce(lambda s, i: s + orig[i], MIXIN_KEY_ENC_TAB, '')[:32]
-
         try:
-            nav_resp = requests.get(
-                "https://api.bilibili.com/x/web-interface/wbi/index/nav",
-                headers=headers, timeout=10, verify=False
-            )
-            if nav_resp.status_code == 200:
-                nav_data = nav_resp.json()
-                if nav_data.get("code") == 0:
-                    img_url = nav_data["data"]["wbi_img"]["img_url"]
-                    sub_url = nav_data["data"]["wbi_img"]["sub_url"]
-                    img_key = img_url.rsplit("/", 1)[1].split(".")[0]
-                    sub_key = sub_url.rsplit("/", 1)[1].split(".")[0]
-                    mixin_key = get_mixin_key(img_key + sub_key)
-
-                    params = {
-                        "mid": int(uid),
-                        "photo": "false",
-                        "platform": "web",
-                    }
-                    params["wts"] = int(time.time())
-                    params = dict(sorted(params.items()))
-                    params = {k: ''.join(filter(lambda c: c not in "!'()*", str(v))) for k, v in params.items()}
-                    query = urlencode(params)
-                    wbi_sign = hashlib.md5((query + mixin_key).encode()).hexdigest()
-                    params["w_rid"] = wbi_sign
-
-                    api_url = f"https://api.bilibili.com/x/wbi/space/acc/info?{urlencode(params)}"
-                    resp = requests.get(api_url, headers=headers, timeout=10, verify=False)
-                    if resp.status_code == 200:
-                        data = resp.json()
-                        if data.get("code") == 0:
-                            info = data.get("data", {})
-                            fans = info.get("fans", 0)
-                            name = info.get("name", "")
-                            if fans > 0:
-                                self._update_uploader_fans(uid, fans, name)
-                                return fans
-        except:
-            pass
+            params = {
+                "mid": int(uid),
+                "photo": "false",
+                "platform": "web",
+            }
+            signed_params = self.get_wbi_signed_params(params, headers)
+            api_url = f"https://api.bilibili.com/x/wbi/space/acc/info?{urlencode(signed_params)}"
+            resp = requests.get(api_url, headers=headers, timeout=10, verify=False)
+            if resp.status_code == 200:
+                data = resp.json()
+                if data.get("code") == 0:
+                    info = data.get("data", {})
+                    fans = info.get("fans", 0)
+                    name = info.get("name", "")
+                    if fans > 0:
+                        self._update_uploader_fans(uid, fans, name)
+                        return fans
+        except Exception as e:
+            self.log(f"  [粉丝获取失败] UID={uid}: {e}")
 
         return None
 
@@ -904,7 +929,7 @@ class BiliSpider:
                 """, (uid, name, fans, now))
             else:
                 cursor.execute("UPDATE bili_uploaders SET fans = ?, fetched_at = ? WHERE uid = ?", (fans, now, uid))
-            self.conn.commit()
+            self.db.conn.commit()
         except:
             pass
 
@@ -915,72 +940,96 @@ class BiliSpider:
         error = self._last_error
         return av_id, detail, error
 
-    def fetch_video_comments(self, av_id, play_nums, pubdate=None):
-        headers = self.cookie_mgr.get_headers()
-        headers['Referer'] = 'https://www.bilibili.com/'
-        
-        try:
-            comment_url = f"https://api.bilibili.com/x/v2/reply/main?type=1&oid={av_id}&mode=3&next=0"
-            resp = requests.get(comment_url, headers=headers, timeout=15, verify=False)
+    def fetch_video_comments(self, av_id, play_nums, pubdate=None, max_retries=3):
+        for attempt in range(max_retries):
+            headers = self.cookie_mgr.get_headers()
+            headers['Referer'] = 'https://www.bilibili.com/'
             
-            if resp.status_code == 412:
-                time.sleep(2)
+            try:
+                params = {
+                    "type": 1,
+                    "oid": int(av_id),
+                    "mode": 3,
+                    "next": 0,
+                }
+                signed_params = self.get_wbi_signed_params(params, headers)
+                comment_url = f"https://api.bilibili.com/x/v2/reply/main?{urlencode(signed_params)}"
                 resp = requests.get(comment_url, headers=headers, timeout=15, verify=False)
-            
-            if resp.status_code != 200:
-                return None
-            
-            data = resp.json()
-            if data.get("code") != 0:
-                return None
-            
-            reply_data = data.get('data', {})
-            replies = reply_data.get('replies', []) or []
-            pagination = reply_data.get('cursor', {}).get('pagination', {})
-            
-            comment_count = pagination.get('count', 0)
-            
-            if not replies:
-                return None
-            
-            earliest_ctime = replies[-1].get('ctime', 0)
-            latest_ctime = replies[0].get('ctime', 0)
-            
-            if not earliest_ctime:
-                return None
-            
-            from datetime import datetime
-            
-            if pubdate:
-                try:
-                    pub_dt = datetime.strptime(pubdate.split('.')[0], '%Y-%m-%d %H:%M:%S')
-                    pub_ts = int(pub_dt.timestamp())
-                    actual_start = min(earliest_ctime, pub_ts)
-                except:
+                
+                if resp.status_code == 412:
+                    wait = (attempt + 1) * 3
+                    if attempt < max_retries - 1:
+                        self.log(f"  [评论限流] av{av_id} 等待 {wait} 秒后重试 ({attempt+1}/{max_retries})...")
+                        time.sleep(wait)
+                        continue
+                    else:
+                        return None
+                
+                if resp.status_code != 200:
+                    if attempt < max_retries - 1:
+                        time.sleep(random.uniform(1, 3))
+                        continue
+                    return None
+                
+                data = resp.json()
+                if data.get("code") != 0:
+                    if attempt < max_retries - 1:
+                        time.sleep(random.uniform(1, 3))
+                        continue
+                    return None
+                
+                reply_data = data.get('data', {})
+                replies = reply_data.get('replies', []) or []
+                pagination = reply_data.get('cursor', {}).get('pagination', {})
+                
+                comment_count = pagination.get('count', 0)
+                
+                if not replies:
+                    return None
+                
+                earliest_ctime = replies[-1].get('ctime', 0)
+                
+                if not earliest_ctime:
+                    return None
+                
+                from datetime import datetime
+                
+                if pubdate:
+                    try:
+                        pub_dt = datetime.strptime(pubdate.split('.')[0], '%Y-%m-%d %H:%M:%S')
+                        pub_ts = int(pub_dt.timestamp())
+                        actual_start = min(earliest_ctime, pub_ts)
+                    except:
+                        actual_start = earliest_ctime
+                else:
                     actual_start = earliest_ctime
-            else:
-                actual_start = earliest_ctime
-            
-            now = int(time.time())
-            time_span_hours = (now - actual_start) / 3600
-            
-            if time_span_hours > 0 and play_nums > 0:
-                play_velocity = play_nums / time_span_hours
-            else:
-                play_velocity = 0
-            
-            first_comment_time = datetime.fromtimestamp(actual_start).strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
-            
-            return {
-                "first_comment_time": first_comment_time,
-                "comment_count": comment_count or len(replies),
-                "play_velocity": round(play_velocity, 2),
-                "time_span_hours": round(time_span_hours, 2),
-            }
-            
-        except Exception as e:
-            self.log(f"  [评论获取失败] {av_id}: {e}")
-            return None
+                
+                now = int(time.time())
+                time_span_hours = (now - actual_start) / 3600
+                
+                if time_span_hours > 0 and play_nums > 0:
+                    play_velocity = play_nums / time_span_hours
+                else:
+                    play_velocity = 0
+                
+                first_comment_time = datetime.fromtimestamp(actual_start).strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
+                
+                return {
+                    "first_comment_time": first_comment_time,
+                    "comment_count": comment_count or len(replies),
+                    "play_velocity": round(play_velocity, 2),
+                    "time_span_hours": round(time_span_hours, 2),
+                }
+                
+            except Exception as e:
+                if attempt < max_retries - 1:
+                    self.log(f"  [评论异常] av{av_id} 重试 ({attempt+1}/{max_retries}): {e}")
+                    time.sleep(random.uniform(1, 3))
+                else:
+                    self.log(f"  [评论获取失败] {av_id}: {e}")
+                    return None
+        
+        return None
 
     def enrich_videos_with_comments(self, limit=50):
         self.log(f"\n{'='*60}")
@@ -1063,8 +1112,8 @@ class BiliSpider:
             self.log(f"  找到 {len(results)} 个，新增 {new_count} 个")
             time.sleep(random.uniform(self.args.delay, self.args.delay + 1))
 
-        today_ids = self.db.get_today_av_ids()
-        new_ids = list(all_av_ids - today_ids)
+        existing_ids = self.db.get_existing_av_ids()
+        new_ids = list(all_av_ids - existing_ids)
 
         self.log(f"\n[搜索完成] 共 {len(all_av_ids)} 个视频，今日已爬 {len(all_av_ids) - len(new_ids)} 个，新增 {len(new_ids)} 个")
         self.log(f"[搜索统计] 搜索失败页数: {len(failed_pages)}")
