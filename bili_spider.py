@@ -133,6 +133,25 @@ class Database:
         """)
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_failed_task_id ON failed_videos(task_id)")
 
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS video_history (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                av_id TEXT NOT NULL,
+                task_id INTEGER,
+                play_nums INTEGER,
+                danmakus INTEGER,
+                favorites INTEGER,
+                review INTEGER,
+                coin INTEGER,
+                share INTEGER,
+                like_count INTEGER,
+                record_time DATETIME DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (task_id) REFERENCES spider_tasks(id)
+            )
+        """)
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_history_av_id ON video_history(av_id)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_history_time ON video_history(record_time)")
+
         self._migrate_columns()
         self.conn.commit()
 
@@ -194,6 +213,22 @@ class Database:
             video_data.get("tags"),
             video_data.get("category"),
         ))
+
+        cursor.execute("""
+            INSERT INTO video_history 
+            (av_id, task_id, play_nums, danmakus, favorites, review, coin, share, like_count)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (
+            video_data.get("av_id"),
+            task_id,
+            video_data.get("play_nums", 0),
+            video_data.get("danmakus", 0),
+            video_data.get("favorites", 0),
+            video_data.get("review", 0),
+            video_data.get("coin", 0),
+            video_data.get("share", 0),
+            video_data.get("like_count", 0),
+        ))
         self.conn.commit()
 
     def insert_failed_video(self, task_id, av_id, error_type, error_msg):
@@ -238,6 +273,199 @@ class Database:
         """, (task_id,))
         row = cursor.fetchone()
         return {"total": row[0], "success": row[1] or 0}
+
+    MIN_TIME_SPAN_HOURS = 48
+
+    def calculate_momentum(self, av_id, metrics=None, video_pubdate=None):
+        if metrics is None:
+            metrics = ["play_nums", "danmakus", "favorites", "review", "like_count"]
+        
+        cursor = self.conn.cursor()
+        cursor.execute("""
+            SELECT * FROM video_history 
+            WHERE av_id = ? 
+            ORDER BY record_time ASC
+        """, (av_id,))
+        records = cursor.fetchall()
+        col_names = [desc[0] for desc in cursor.description]
+        records_dict = [dict(zip(col_names, record)) for record in records]
+        
+        result = {
+            "av_id": av_id,
+            "data_points": len(records_dict),
+            "time_span_hours": 0,
+            "status": "no_data",
+            "status_desc": "无历史数据",
+            "metrics": {},
+            "composite_score": None
+        }
+
+        if len(records_dict) == 0:
+            return result
+
+        if len(records_dict) == 1:
+            result["status"] = "first_record"
+            result["status_desc"] = "首次采集，仅显示当前值"
+            for metric in metrics:
+                result["metrics"][metric] = {
+                    "current": records_dict[0].get(metric, 0),
+                    "total_growth_pct": None,
+                    "cagr_daily_pct": None,
+                    "avg_incremental_pct": None,
+                    "is_momentum_valid": False
+                }
+            return result
+
+        first_time = datetime.fromisoformat(records_dict[0]["record_time"])
+        last_time = datetime.fromisoformat(records_dict[-1]["record_time"])
+        time_span_hours = (last_time - first_time).total_seconds() / 3600
+        result["time_span_hours"] = round(time_span_hours, 2)
+
+        is_time_valid = time_span_hours >= self.MIN_TIME_SPAN_HOURS
+
+        if not is_time_valid:
+            result["status"] = "data_insufficient"
+            result["status_desc"] = f"数据积累中（需≥{self.MIN_TIME_SPAN_HOURS}小时，当前{time_span_hours:.1f}小时）"
+        else:
+            result["status"] = "momentum_ready"
+            result["status_desc"] = "动量可计算"
+
+        for metric in metrics:
+            values = [r.get(metric, 0) for r in records_dict]
+            current = values[-1]
+            previous = values[0]
+
+            metric_result = {
+                "current": current,
+                "total_growth_pct": None,
+                "cagr_daily_pct": None,
+                "avg_incremental_pct": None,
+                "is_momentum_valid": is_time_valid
+            }
+
+            if is_time_valid and previous > 0:
+                total_growth = (current - previous) / previous * 100
+                metric_result["total_growth_pct"] = round(total_growth, 2)
+
+                time_span_days = max(time_span_hours / 24, 0.5)
+                cagr = ((current / previous) ** (1 / time_span_days) - 1) * 100
+                metric_result["cagr_daily_pct"] = round(cagr, 2)
+
+                if len(values) >= 3:
+                    changes = [(values[i] - values[i-1]) / max(values[i-1], 1) * 100 
+                              for i in range(1, len(values))]
+                    metric_result["avg_incremental_pct"] = round(sum(changes) / len(changes), 2)
+
+            result["metrics"][metric] = metric_result
+
+        if video_pubdate and result["status"] == "momentum_ready":
+            try:
+                pubdate_dt = datetime.strptime(video_pubdate, "%Y-%m-%d %H:%M:%S")
+                age_days = (datetime.now() - pubdate_dt).days
+                result["video_age_days"] = age_days
+            except:
+                result["video_age_days"] = None
+
+        return result
+
+    def calculate_freshness_weight(self, video_age_days):
+        if video_age_days is None or video_age_days < 0:
+            return 1.0
+        if video_age_days <= 1:
+            return 2.0
+        elif video_age_days <= 3:
+            return 1.7
+        elif video_age_days <= 7:
+            return 1.4
+        elif video_age_days <= 14:
+            return 1.2
+        elif video_age_days <= 30:
+            return 1.1
+        elif video_age_days <= 90:
+            return 1.0
+        else:
+            return 0.8
+
+    def get_keyword_momentum_ranking(self, keyword, metric="play_nums", limit=20):
+        cursor = self.conn.cursor()
+        cursor.execute("""
+            SELECT v.av_id, v.title, v.play_nums, v.pubdate, v.uploader_uid
+            FROM bili_videos v
+            JOIN spider_tasks t ON v.task_id = t.id
+            WHERE t.keyword = ?
+            ORDER BY v.play_nums DESC
+        """, (keyword,))
+        videos = cursor.fetchall()
+
+        cursor2 = self.conn.cursor()
+        cursor2.execute("""
+            SELECT MAX(play_nums) as max_plays, MIN(play_nums) as min_plays
+            FROM bili_videos v
+            JOIN spider_tasks t ON v.task_id = t.id
+            WHERE t.keyword = ?
+        """, (keyword,))
+        max_min = cursor2.fetchone()
+        max_plays = max_min[0] or 1
+        min_plays = max_min[1] or 0
+
+        results = []
+        for video in videos:
+            av_id, title, current_plays, pubdate, uploader_uid = video
+            momentum = self.calculate_momentum(av_id, [metric], pubdate)
+
+            video_info = {
+                "av_id": av_id,
+                "title": title,
+                "current_value": current_plays or 0,
+                "pubdate": pubdate,
+                "uploader_uid": uploader_uid,
+                "status": momentum["status"],
+                "status_desc": momentum["status_desc"],
+                "data_points": momentum["data_points"],
+                "time_span_hours": momentum["time_span_hours"],
+                "total_growth_pct": None,
+                "cagr_daily_pct": None,
+                "avg_incremental_pct": None,
+                "freshness_weight": 1.0,
+                "normalized_value": 0,
+                "momentum_score": 0,
+                "composite_score": 0
+            }
+
+            if metric in momentum["metrics"]:
+                m = momentum["metrics"][metric]
+                video_info["total_growth_pct"] = m["total_growth_pct"]
+                video_info["cagr_daily_pct"] = m["cagr_daily_pct"]
+                video_info["avg_incremental_pct"] = m["avg_incremental_pct"]
+
+            video_age = momentum.get("video_age_days")
+            video_info["freshness_weight"] = self.calculate_freshness_weight(video_age)
+
+            if max_plays > min_plays:
+                video_info["normalized_value"] = (current_plays - min_plays) / (max_plays - min_plays)
+            else:
+                video_info["normalized_value"] = 0.5
+
+            if momentum["status"] == "momentum_ready":
+                cagr = video_info["cagr_daily_pct"] or 0
+                momentum_score = min(max(cagr + 100, 0), 500) / 500
+                video_info["momentum_score"] = momentum_score
+                video_info["composite_score"] = (
+                    video_info["normalized_value"] * 0.5 +
+                    momentum_score * 0.3 +
+                    video_info["freshness_weight"] * 0.2
+                )
+            else:
+                video_info["momentum_score"] = 0
+                video_info["composite_score"] = (
+                    video_info["normalized_value"] * 0.7 +
+                    video_info["freshness_weight"] * 0.3
+                )
+
+            results.append(video_info)
+
+        results.sort(key=lambda x: x["composite_score"], reverse=True)
+        return results[:limit]
 
     def close(self):
         self.conn.close()
@@ -563,6 +791,86 @@ class BiliSpider:
             self.log(f"\n[导出] 无数据可导出 (关键词: {keyword})")
             return None
 
+    def analyze_momentum(self):
+        keyword = self.args.keyword
+        metric = self.args.momentum_metric
+        limit = self.args.momentum_limit
+        
+        self.log(f"\n{'=' * 60}")
+        self.log(f"  动量分析")
+        self.log(f"{'=' * 60}")
+        self.log(f"关键词: {keyword}")
+        self.log(f"指标: {metric}")
+        self.log(f"显示数量: {limit}")
+        self.log("")
+
+        ranking = self.db.get_keyword_momentum_ranking(keyword, metric, limit)
+
+        if not ranking:
+            self.log("[动量分析] 无数据可分析")
+            return
+
+        metric_names = {
+            "play_nums": "播放量",
+            "danmakus": "弹幕数",
+            "favorites": "收藏数",
+            "review": "评论数",
+            "like_count": "点赞数"
+        }
+        metric_name = metric_names.get(metric, metric)
+
+        self.log(f"\n动量排行 Top {limit}（按日均复合增长率排序）")
+        self.log("-" * 100)
+        self.log(f"{'排名':<4} {'标题':<40} {'当前' + metric_name:>12} {'总增长%':>10} {'日均%':>10} {'数据点':>6} {'跨度(h)':>8}")
+        self.log("-" * 100)
+
+        for i, item in enumerate(ranking, 1):
+            title = item["title"][:38] if item["title"] else "未知"
+            current = f"{item['current_value']:,}" if item['current_value'] else "-"
+            total_growth = f"{item['total_growth_pct']:.1f}%" if item.get('total_growth_pct') is not None else "N/A"
+            cagr = f"{item['cagr_daily_pct']:.2f}%" if item.get('cagr_daily_pct') is not None else "N/A"
+            data_points = item.get('data_points', 1)
+            time_span = f"{item['time_span_hours']:.1f}" if item.get('time_span_hours') else "0"
+            
+            self.log(f"{i:<4} {title:<40} {current:>12} {total_growth:>10} {cagr:>10} {data_points:>6} {time_span:>8}")
+
+        self.log("-" * 100)
+
+        if self.args.export_momentum:
+            self._export_momentum_csv(ranking, keyword, metric)
+
+    def _export_momentum_csv(self, ranking, keyword, metric):
+        output_dir = os.path.join("output", keyword)
+        os.makedirs(output_dir, exist_ok=True)
+        
+        today = datetime.now().strftime("%Y%m%d")
+        output_file = os.path.join(output_dir, f"momentum_{today}.csv")
+
+        import csv
+        with open(output_file, "w", newline="", encoding="utf-8-sig") as f:
+            writer = csv.writer(f)
+            writer.writerow([
+                "排名", "av_id", "标题", "当前值", "总增长%", 
+                "日均增长%", "增量均值%", "数据点数量", "时间跨度(小时)",
+                "发布时间", "作者UID"
+            ])
+            for i, item in enumerate(ranking, 1):
+                writer.writerow([
+                    i,
+                    item["av_id"],
+                    item["title"],
+                    item.get("current_value", 0),
+                    item.get("total_growth_pct", "N/A"),
+                    item.get("cagr_daily_pct", "N/A"),
+                    item.get("avg_incremental_pct", "N/A"),
+                    item.get("data_points", 1),
+                    item.get("time_span_hours", 0),
+                    item.get("pubdate", ""),
+                    item.get("uploader_uid", ""),
+                ])
+
+        self.log(f"\n[导出] 动量分析结果已保存到 {output_file}")
+
 
 def main():
     parser = argparse.ArgumentParser(
@@ -574,6 +882,9 @@ def main():
   python bili_spider.py --keyword 穿搭 --pages 5 --order pubdate -e
   python bili_spider.py --keyword 美食 --pages 3 --threads 5
   python bili_spider.py --keyword 服饰 --export-only  # 仅导出CSV
+  python bili_spider.py --keyword 服饰 --momentum  # 动量分析
+  python bili_spider.py -k 服饰 -m --momentum-metric favorites  # 收藏动量
+  python bili_spider.py -k 服饰 -m --export-momentum  # 导出动量结果
         """
     )
 
@@ -592,6 +903,15 @@ def main():
                         help="完成后导出CSV文件")
     parser.add_argument("--export-only", action="store_true",
                         help="仅从数据库导出CSV，不执行爬取")
+    parser.add_argument("--momentum", "-m", action="store_true",
+                        help="进行动量分析，评估视频增长趋势")
+    parser.add_argument("--momentum-metric", type=str, default="play_nums",
+                        choices=["play_nums", "danmakus", "favorites", "review", "like_count"],
+                        help="动量分析指标 (默认: play_nums)")
+    parser.add_argument("--momentum-limit", type=int, default=20,
+                        help="动量分析显示数量 (默认: 20)")
+    parser.add_argument("--export-momentum", action="store_true",
+                        help="导出动量分析结果为CSV")
 
     args = parser.parse_args()
 
@@ -605,6 +925,8 @@ def main():
             spider.run()
             if args.export:
                 spider.export_csv()
+            if args.momentum:
+                spider.analyze_momentum()
     except KeyboardInterrupt:
         print("\n[中断] 用户手动停止")
         spider.db.update_task(spider.task_id, status="failed", error_msg="用户中断")
