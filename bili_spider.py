@@ -420,16 +420,15 @@ class Database:
             now,
         ))
 
-    def update_video_comments(self, av_id, first_comment_time, comment_count, play_velocity, time_span_hours):
+    def update_video_comments(self, av_id, first_comment_time, play_velocity, time_span_hours):
         cursor = self.conn.cursor()
         cursor.execute("""
             UPDATE bili_videos 
             SET first_comment_time = ?,
-                comment_count = ?,
                 play_velocity = ?,
                 time_span_hours = ?
             WHERE av_id = ?
-        """, (first_comment_time, comment_count, play_velocity, time_span_hours, av_id))
+        """, (first_comment_time, play_velocity, time_span_hours, av_id))
         self.conn.commit()
 
     def get_videos_needing_comments(self, limit=50):
@@ -437,7 +436,7 @@ class Database:
         cursor.execute("""
             SELECT av_id, play_nums, pubdate 
             FROM bili_videos 
-            WHERE (first_comment_time IS NULL OR comment_count = 0)
+            WHERE (first_comment_time IS NULL OR comment_count = 0 OR comment_count <= 20)
               AND play_nums > 0
             ORDER BY play_nums DESC
             LIMIT ?
@@ -672,7 +671,7 @@ class Database:
         """
         cursor = self.conn.cursor()
         cursor.execute("""
-            SELECT v.av_id, v.title, v.play_nums, v.pubdate, v.uploader_uid, v.uploader_fans,
+            SELECT v.av_id, v.title, v.play_nums, v.pubdate, v.uploader, v.uploader_uid, v.uploader_fans,
                    v.play_velocity, v.video_age_hours, v.engagement_score,
                    v.comment_count, v.like_count, v.coin, v.share, v.danmakus, v.review
             FROM bili_videos v
@@ -685,35 +684,35 @@ class Database:
         if not videos:
             return []
 
-        # 计算归一化所需的极值
-        velocities = [v[6] for v in videos if v[6] and v[6] > 0]
+        # 计算归一化所需的极值（全部强制转数值，兼容数据库脏数据）
+        velocities = [float(v[7]) for v in videos if v[7] and float(v[7]) > 0]
         max_velocity = max(velocities) if velocities else 1
 
         conversions = []
         for v in videos:
-            fans = v[5] or 0
+            fans = float(v[5] or 0)
             if fans > 0:
-                conversions.append((v[2] or 0) / fans)
+                conversions.append(float(v[2] or 0) / fans)
         max_conversion = max(conversions) if conversions else 1
 
-        engagements = [v[8] for v in videos if v[8] and v[8] > 0]
+        engagements = [float(v[9]) for v in videos if v[9] and float(v[9]) > 0]
         max_engagement = max(engagements) if engagements else 1
 
-        plays = [v[2] for v in videos if v[2]]
+        plays = [float(v[2]) for v in videos if v[2]]
         max_plays = max(plays) if plays else 1
         min_plays = min(plays) if plays else 0
 
         results = []
         for video in videos:
-            (av_id, title, current_plays, pubdate, uploader_uid, uploader_fans,
+            (av_id, title, current_plays, pubdate, uploader, uploader_uid, uploader_fans,
              play_velocity, video_age_hours, engagement_raw,
              comment_count, like_count, coin, share, danmakus, review) = video
 
-            current_plays = current_plays or 0
-            uploader_fans = uploader_fans or 0
-            play_velocity = play_velocity or 0
-            video_age_hours = video_age_hours or 0
-            engagement_raw = engagement_raw or 0
+            current_plays = int(current_plays or 0)
+            uploader_fans = int(uploader_fans or 0)
+            play_velocity = float(play_velocity or 0)
+            video_age_hours = float(video_age_hours or 0)
+            engagement_raw = float(engagement_raw or 0)
 
             # 1. 播放速率得分
             velocity_score = min(play_velocity / max_velocity, 1.0) if max_velocity > 0 else 0
@@ -758,7 +757,7 @@ class Database:
                     h_cursor.execute("""
                         SELECT play_nums FROM video_history WHERE av_id = ? ORDER BY record_time ASC
                     """, (av_id,))
-                    history = [r[0] for r in h_cursor.fetchall()]
+                    history = [float(r[0]) for r in h_cursor.fetchall()]
                     if history and history[0] > 0:
                         historical_growth = round((history[-1] - history[0]) / history[0] * 100, 2)
             except:
@@ -769,13 +768,14 @@ class Database:
                 "title": title,
                 "current_value": current_plays,
                 "pubdate": pubdate,
+                "uploader": uploader,
                 "uploader_uid": uploader_uid,
                 "uploader_fans": uploader_fans,
                 "conversion_rate": round(conversion_rate, 2),
                 "play_velocity": round(play_velocity, 2),
                 "engagement_score": round(engagement_raw, 4),
                 "video_age_hours": round(video_age_hours, 1),
-                "comment_count": comment_count or 0,
+                "comment_count": review or 0,
                 "velocity_score": round(velocity_score, 4),
                 "conversion_score": round(conversion_score, 4),
                 "engagement_norm_score": round(engagement_score, 4),
@@ -1291,9 +1291,6 @@ class BiliSpider:
                 
                 reply_data = data.get('data', {})
                 replies = reply_data.get('replies', []) or []
-                pagination = reply_data.get('cursor', {}).get('pagination', {})
-                
-                comment_count = pagination.get('count', 0)
                 
                 if not replies:
                     return None
@@ -1327,7 +1324,6 @@ class BiliSpider:
                 
                 return {
                     "first_comment_time": first_comment_time,
-                    "comment_count": comment_count or len(replies),
                     "play_velocity": round(play_velocity, 2),
                     "time_span_hours": round(time_span_hours, 2),
                 }
@@ -1367,7 +1363,6 @@ class BiliSpider:
                 self.db.update_video_comments(
                     av_id,
                     result['first_comment_time'],
-                    result['comment_count'],
                     result['play_velocity'],
                     result['time_span_hours']
                 )
@@ -1378,6 +1373,19 @@ class BiliSpider:
             time.sleep(random.uniform(0.3, 0.8))
         
         self.log(f"\n[完成] 评论数据补充: 成功 {success}, 失败 {fail}")
+
+    def fix_comment_count_from_review(self):
+        """用视频详情API的review字段修复错误的comment_count"""
+        cursor = self.db.conn.cursor()
+        cursor.execute("""
+            UPDATE bili_videos 
+            SET comment_count = review 
+            WHERE review > 0 AND (comment_count = 0 OR comment_count <= 20)
+        """)
+        fixed = cursor.rowcount
+        self.db.conn.commit()
+        if fixed > 0:
+            self.log(f"[修复] 已修正 {fixed} 条视频的评论数 (comment_count <- review)")
 
     def enrich_videos_with_fans(self, keyword=None):
         """自动检测并补充粉丝数为0的UP主数据（三级回退）"""
@@ -1626,7 +1634,7 @@ class BiliSpider:
         with open(output_file, "w", newline="", encoding="utf-8-sig") as f:
             writer = csv.writer(f)
             writer.writerow([
-                "排名", "av_id", "标题", "播放量", "UP主UID", "粉丝数", "粉丝转化率",
+                "排名", "av_id", "标题", "播放量", "UP主", "UP主UID", "粉丝数", "粉丝转化率",
                 "播放速率(次/小时)", "视频年龄(小时)", "互动密度", "评论数",
                 "速率得分", "转化得分", "互动得分", "新鲜度得分", "播放量得分",
                 "历史增长%", "数据点数量", "发布时间", "综合评分"
@@ -1637,6 +1645,7 @@ class BiliSpider:
                     item["av_id"],
                     item["title"],
                     item.get("current_value", 0),
+                    item.get("uploader", ""),
                     item.get("uploader_uid", ""),
                     item.get("uploader_fans", 0),
                     item.get("conversion_rate", 0),
@@ -1694,6 +1703,7 @@ def main():
             spider.export_csv(args.keyword)
         else:
             spider.run()
+            spider.fix_comment_count_from_review()
             spider.enrich_videos_with_fans(args.keyword)
             spider.analyze_momentum()
     except KeyboardInterrupt:
