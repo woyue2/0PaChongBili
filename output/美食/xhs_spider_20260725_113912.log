@@ -1,0 +1,14 @@
+[2026-07-25 11:39:12.991] 日志文件: output\美食\xhs_spider_20260725_113912.log
+[2026-07-25 11:39:13.003] [任务] 创建任务#6: 关键词='美食', 页数=1, 排序=general
+[2026-07-25 11:39:14.605] [浏览器] 已注入 16 个 cookie
+[2026-07-25 11:39:14.986] [浏览器] Edge 浏览器已启动 (headless=False)
+[2026-07-25 11:39:14.988] [搜索] 关键词='美食' 第1页 排序=general
+[2026-07-25 11:39:24.407] [搜索] ✓ 返回 22 条笔记
+[2026-07-25 11:39:24.410] [任务] 第1页搜索到 22 条，累计 21 条
+[2026-07-25 11:39:24.414] [任务] 第1页：处理 21 条详情（1-21/21）...
+[2026-07-25 11:39:29.555] [任务] 详情异常: cannot access local variable 'detail' where it is not associated with a value
+[2026-07-25 11:39:38.585] [任务] 详情异常: cannot access local variable 'detail' where it is not associated with a value
+[2026-07-25 11:39:48.355] [任务] 详情异常: cannot access local variable 'detail' where it is not associated with a value
+[2026-07-25 11:39:56.978] [任务] 详情异常: cannot access local variable 'detail' where it is not associated with a value
+[2026-07-25 11:40:05.168] [任务] 详情异常: cannot access local variable 'detail' where it is not associated with a value
+[2026-07-25 11:40:14.515] [任务] 详情异常: cannot access local variable 'detail' where it is not associated with a value

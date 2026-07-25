@@ -46,7 +46,7 @@ class BiliSpider:
         self._init_logger()
 
     def _init_logger(self):
-        log_dir = self.output_dir or "logs"
+        log_dir = "logs"
         os.makedirs(log_dir, exist_ok=True)
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         self.log_file = os.path.join(log_dir, f"bili_spider_{timestamp}.log")
