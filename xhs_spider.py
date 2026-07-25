@@ -110,6 +110,7 @@ class XhsSpider:
             self._context = self._browser.new_context(
                 viewport={"width": 1920, "height": 1080},
                 user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36 Edg/120.0.0.0",
+                permissions=["clipboard-read", "clipboard-write"],
             )
 
             if cookies_for_pw:
@@ -118,6 +119,57 @@ class XhsSpider:
 
             self._page = self._context.new_page()
             self._page.on("response", self._on_response)
+
+            # Hook navigator.clipboard.writeText / readText：把写入的完整分享链接存到全局变量
+            # 小红书点「复制链接」后会调 clipboard.writeText(完整URL)，直接读 hook 就能拿到，
+            # 不再受 headless 剪贴板权限/系统隔离影响
+            self._page.add_init_script("""() => {
+                try {
+                    window.__xhs_last_share_link__ = '';
+                    window.__xhs_share_link_log__ = [];
+                    const origWrite = navigator.clipboard && navigator.clipboard.writeText
+                        ? navigator.clipboard.writeText.bind(navigator.clipboard) : null;
+                    if (origWrite) {
+                        navigator.clipboard.writeText = function(txt) {
+                            try {
+                                const s = (txt == null ? '' : String(txt));
+                                window.__xhs_share_link_log__.push(s);
+                                if (s && (
+                                    s.includes('xiaohongshu.com/') ||
+                                    s.includes('xhslink.com/') ||
+                                    s.includes('xsec_token=') ||
+                                    s.includes('xhsshare=')
+                                )) {
+                                    window.__xhs_last_share_link__ = s;
+                                }
+                            } catch(_) {}
+                            return origWrite(txt);
+                        };
+                    }
+                    // document.execCommand('copy') 的 fallback 拦截，部分老路径会用这个
+                    const origExec = document.execCommand.bind(document);
+                    document.execCommand = function(cmdId, showUI, value) {
+                        try {
+                            if (/copy/i.test(String(cmdId || ''))) {
+                                // 尝试从当前 selection / 临时隐藏 input 抓内容
+                                const sel = (window.getSelection && window.getSelection()) || {toString:()=>''};
+                                const candidate = (value != null ? String(value) : '') || (sel.toString ? sel.toString() : '');
+                                if (candidate && (
+                                    candidate.includes('xiaohongshu.com/') ||
+                                    candidate.includes('xhslink.com/') ||
+                                    candidate.includes('xsec_token=') ||
+                                    candidate.includes('xhsshare=')
+                                )) {
+                                    window.__xhs_last_share_link__ = candidate;
+                                    window.__xhs_share_link_log__.push(candidate);
+                                }
+                            }
+                        } catch(_) {}
+                        return origExec(cmdId, showUI, value);
+                    };
+                } catch(_) {}
+            }""")
+
             self.log(f"[浏览器] Edge 浏览器已启动 (headless={headless})")
 
     def _on_response(self, response):
@@ -311,7 +363,7 @@ class XhsSpider:
 
     def _extract_pubtime_tags_from_dom(self):
         try:
-            return self._page.evaluate("""() => {
+            return self._page.evaluate(r"""() => {
                 const result = {};
                 const mask = document.querySelector('.note-detail-mask');
                 if (!mask) return null;
@@ -383,6 +435,14 @@ class XhsSpider:
                     }
                 }
 
+                // ── 作者主页链接（用于获取 user_id 和粉丝数）──────────────
+                const authorLink = mask.querySelector('a[href*="/user/profile/"]');
+                if (authorLink) {
+                    const href = authorLink.getAttribute('href') || '';
+                    const m = href.match(/\/user\/profile\/([a-f0-9]+)/);
+                    if (m) result.author_user_id = m[1];
+                }
+
                 // ── note_id（备用） ────────────────────────────────────────
                 const noteIdAttr = mask.getAttribute('note-id') || mask.getAttribute('data-note-id');
                 if (noteIdAttr) result.note_id = noteIdAttr;
@@ -398,6 +458,373 @@ class XhsSpider:
                 return result;
             }""")
         except Exception:
+            return None
+
+    def _fetch_fans_count(self, user_id):
+        """后台 fetch 用户主页 HTML，解析粉丝数。不跳转页面。"""
+        if not user_id:
+            return 0
+        # 先查数据库缓存
+        cached = self.db.get_user_fans(user_id)
+        if cached > 0:
+            return cached
+        try:
+            result = self._page.evaluate(r"""async (userId) => {
+                try {
+                    const resp = await fetch('/user/profile/' + userId, {
+                        credentials: 'include',
+                        headers: {'Accept': 'text/html'}
+                    });
+                    if (!resp.ok) return null;
+                    const html = await resp.text();
+                    // 方式1: meta 标签 <meta name="description" content="...粉丝数: 1.2万...">
+                    const metaDesc = html.match(/<meta[^>]*name="description"[^>]*content="([^"]*)"/i);
+                    if (metaDesc) {
+                        const fansMatch = metaDesc[1].match(/粉丝数[：:]\s*([\d.]+[万亿]?)/);
+                        if (fansMatch) return fansMatch[1];
+                    }
+                    // 方式2: JSON-LD 或初始化数据
+                    const initData = html.match(/window\.__INITIAL_STATE__\s*=\s*({.*?})\s*<\/script>/s);
+                    if (initData) {
+                        try {
+                            const state = JSON.parse(initData[1].replace(/undefined/g, 'null'));
+                            const userInfo = state.user && (state.user.userPageData || state.user.me);
+                            if (userInfo && userInfo.fansCount) return String(userInfo.fansCount);
+                            if (userInfo && userInfo.fans) return String(userInfo.fans);
+                        } catch(e) {}
+                    }
+                    // 方式3: DOM 中的粉丝数元素
+                    const fansEl = html.match(/class="[^"]*fans[^"]*"[^>]*>([^<]+)</i);
+                    if (fansEl) return fansEl[1].trim();
+                    return null;
+                } catch(e) { return null; }
+            }""", user_id)
+            if result:
+                fans = _parse_chinese_num(result)
+                if fans > 0:
+                    # 缓存到数据库
+                    nickname = ""  # 暂不知昵称，仅更新粉丝数
+                    self.db.upsert_user(user_id, nickname, fans=fans)
+                    return fans
+        except Exception as e:
+            self.log(f"[粉丝数] 获取 user={user_id} 失败: {e}")
+        return 0
+
+    def _get_share_link(self, note_id=""):
+        """点击分享按钮 → 点「复制链接」按钮 → 读剪贴板获取真实分享短链。"""
+        constructed = ""
+        if note_id:
+            constructed = f"https://www.xiaohongshu.com/explore/{note_id}"
+
+        def _pick(s):
+            if not s:
+                return ""
+            s = str(s).strip()
+            if not s.startswith("http"):
+                return ""
+            is_share_link = (
+                "xhslink" in s
+                or "xiaohongshu.com/explore/" in s
+                or "xiaohongshu.com/discovery/item/" in s
+            )
+            if not is_share_link:
+                return ""
+            return s
+
+        try:
+            # 1. 点击分享按钮
+            share_btn = self._page.query_selector(
+                ".note-detail-mask .buttons[data-v-2820500a] .share-icon, "
+                ".note-detail-mask .share-icon-container"
+            )
+            if not share_btn:
+                if constructed:
+                    self.log(f"[分享链接] 无分享按钮 → 返回构造链接: {constructed}")
+                    return constructed
+                return None
+            share_btn.click()
+            time.sleep(1.2)
+
+            # 2. 等分享弹窗（两种都可能）
+            share_popup = None
+            popup1 = None
+            popup2 = None
+            for _ in range(6):
+                popup1 = self._page.query_selector(".share-wrapper[data-v-fe59674e]")
+                popup2 = self._page.query_selector(".xhs-note-share-popup[data-v-0d218a15]")
+                p1_ok = bool(popup1 and popup1.is_visible())
+                p2_ok = bool(popup2 and popup2.is_visible())
+                if p1_ok or p2_ok:
+                    share_popup = popup1 if p1_ok else popup2
+                    break
+                time.sleep(0.5)
+
+            if not share_popup:
+                self.log("[分享链接] 分享弹窗未出现")
+                try:
+                    self._page.keyboard.press("Escape")
+                except Exception:
+                    pass
+                if constructed:
+                    self.log(f"[分享链接] 返回构造链接: {constructed}")
+                    return constructed
+                return None
+
+            popup1_found = bool(popup1 and popup1.is_visible())
+            popup2_found = bool(popup2 and popup2.is_visible())
+
+            # 打印调试（头+尾）
+            dbg_target = popup2 if popup2_found else popup1
+            dbg_html = ""
+            try:
+                if dbg_target:
+                    dbg_html = dbg_target.inner_html()
+            except Exception:
+                dbg_html = ""
+            head = dbg_html[:500] if dbg_html else ""
+            tail = dbg_html[-1300:] if len(dbg_html) > 1300 else dbg_html
+            self.log(f"[分享链接] 弹窗调试: popup1={popup1_found} popup2={popup2_found} html_len={len(dbg_html)} head={repr(head)} tail={repr(tail)}")
+
+            link = ""
+            clicked_ok = False
+
+            # 3. 先在当前 page 里安装/重置 clipboard hook（必须在点复制按钮之前！）
+            try:
+                self._page.evaluate("""() => {
+                    try {
+                        if (typeof window.__xhs_last_share_link__ !== 'string') window.__xhs_last_share_link__ = '';
+                        if (!Array.isArray(window.__xhs_share_link_log__)) window.__xhs_share_link_log__ = [];
+                        // 清空旧值
+                        window.__xhs_last_share_link__ = '';
+                        window.__xhs_share_link_log__ = [];
+                        const isShareLike = (s) => typeof s === 'string' && s && (
+                            s.includes('xiaohongshu.com/') ||
+                            s.includes('xhslink.com/') ||
+                            s.includes('xsec_token=') ||
+                            s.includes('xhsshare=')
+                        );
+                        if (navigator.clipboard && typeof navigator.clipboard.writeText === 'function') {
+                            if (!navigator.clipboard.__xhs_orig_writeText) {
+                                navigator.clipboard.__xhs_orig_writeText = navigator.clipboard.writeText.bind(navigator.clipboard);
+                            }
+                            const orig = navigator.clipboard.__xhs_orig_writeText;
+                            navigator.clipboard.writeText = function(txt) {
+                                try {
+                                    const s = (txt == null ? '' : String(txt));
+                                    if (!Array.isArray(window.__xhs_share_link_log__)) window.__xhs_share_link_log__ = [];
+                                    window.__xhs_share_link_log__.push(s);
+                                    if (isShareLike(s)) {
+                                        window.__xhs_last_share_link__ = s;
+                                    }
+                                } catch(_) {}
+                                return orig(txt);
+                            };
+                        }
+                        if (typeof document.execCommand === 'function') {
+                            if (!document.__xhs_orig_exec) {
+                                document.__xhs_orig_exec = document.execCommand.bind(document);
+                            }
+                            const origE = document.__xhs_orig_exec;
+                            document.execCommand = function(cmdId, showUI, value) {
+                                try {
+                                    if (cmdId && /copy/i.test(String(cmdId))) {
+                                        const sel = (window.getSelection && window.getSelection());
+                                        const selStr = (sel && typeof sel.toString === 'function') ? sel.toString() : '';
+                                        const candidate = (value != null ? String(value) : '') || selStr;
+                                        if (isShareLike(candidate)) {
+                                            window.__xhs_last_share_link__ = candidate;
+                                            if (Array.isArray(window.__xhs_share_link_log__)) {
+                                                window.__xhs_share_link_log__.push(candidate);
+                                            }
+                                        }
+                                    }
+                                } catch(_) {}
+                                return origE(cmdId, showUI, value);
+                            };
+                        }
+                    } catch(_) {}
+                }""")
+            except Exception as e:
+                self.log(f"[分享链接] 安装hook异常: {e}")
+
+            # 4. 优先 popup2（联系人分享弹窗）底部 3 个 action 中：「复制链接」按钮
+            if popup2_found:
+                copy_el = None
+                try:
+                    # 精准：遍历 .xhs-note-share-popup-actions 下的 item，label 文本为"复制链接"
+                    action_items = popup2.query_selector_all(".xhs-note-share-popup-action-item")
+                    for it in action_items:
+                        try:
+                            label = it.query_selector(".xhs-note-share-popup-action-label")
+                            txt = (label.inner_text() if label else "") or ""
+                            if "复制链接" in txt:
+                                copy_el = it
+                                break
+                        except Exception:
+                            pass
+                except Exception:
+                    pass
+
+                # 兜底：直接按类名（老逻辑）
+                if not copy_el:
+                    label_list = popup2.query_selector_all(".xhs-note-share-popup-action-label")
+                    for lab in label_list:
+                        try:
+                            txt = (lab.inner_text() or "")
+                            if "复制链接" in txt:
+                                copy_el = lab
+                                break
+                        except Exception:
+                            pass
+
+                if copy_el:
+                    try:
+                        copy_el.click()
+                        clicked_ok = True
+                        self.log("[分享链接] ✓ 点击 popup2「复制链接」按钮")
+                        time.sleep(1.4)
+                    except Exception as e:
+                        self.log(f"[分享链接] 点击复制链接按钮异常: {e}")
+                else:
+                    self.log("[分享链接] popup2 未找到「复制链接」按钮元素")
+
+            # 5. popup1（QR 码弹窗）也找一下复制链接 item（兼容老路径）
+            if not clicked_ok and popup1_found:
+                try:
+                    items = popup1.query_selector_all(".item[data-v-fe59674e]")
+                    for it in items:
+                        try:
+                            tip = it.get_attribute("data-tooltip") or ""
+                            if "复制" in tip or "链接" in tip:
+                                it.click()
+                                clicked_ok = True
+                                self.log(f"[分享链接] ✓ 点击 popup1 item tooltip='{tip}'")
+                                time.sleep(1.4)
+                                break
+                        except Exception:
+                            pass
+                    if not clicked_ok and items:
+                        items[0].click()
+                        clicked_ok = True
+                        self.log("[分享链接] 降级点击 popup1 第一个 item")
+                        time.sleep(1.4)
+                except Exception as e:
+                    self.log(f"[分享链接] popup1 item 异常: {e}")
+
+            # 6. 主路径：直接读 hook 捕获到的 clipboard.writeText 入参
+            if clicked_ok:
+                try:
+                    hook_info = self._page.evaluate("""() => {
+                        const last = (typeof window.__xhs_last_share_link__ === 'string') ? window.__xhs_last_share_link__ : '';
+                        const logArr = Array.isArray(window.__xhs_share_link_log__) ? window.__xhs_share_link_log__.slice(-10) : [];
+                        // 读完清空，防串值
+                        window.__xhs_last_share_link__ = '';
+                        if (Array.isArray(window.__xhs_share_link_log__)) window.__xhs_share_link_log__.length = 0;
+                        return { last, log: logArr };
+                    }""")
+                    last_link = ""
+                    hook_log = []
+                    if isinstance(hook_info, dict):
+                        last_link = (hook_info.get("last") or "").strip()
+                        hook_log = hook_info.get("log") or []
+                    picked_hook = _pick(last_link)
+                    if picked_hook:
+                        link = picked_hook
+                        self.log(f"[分享链接] ✓ hook剪贴板写入捕获成功: {link}")
+                    else:
+                        for n, entry in enumerate(reversed(list(hook_log))):
+                            p = _pick(entry)
+                            if p:
+                                link = p
+                                self.log(f"[分享链接] ✓ hook日志(倒数第{n+1}条)命中: {link}")
+                                break
+                        if not link:
+                            self.log(f"[分享链接] hook剪贴板未命中，last={repr(last_link[:120])} log={hook_log!r}")
+                except Exception as e:
+                    self.log(f"[分享链接] hook剪贴板读取异常: {e}")
+
+            # 7. 兜底1：DOM 全局正则搜带 xsec_token 的完整分享链接
+            if clicked_ok and not link:
+                try:
+                    dom_link = self._page.evaluate("""() => {
+                        const regex = /https?:\\/\\/(?:[a-zA-Z0-9-]+\\.)*(?:xiaohongshu\\.com\\/discovery\\/item\\/[A-Fa-f0-9]+[^\\s\"'<>)]*|xhslink\\.com\\/[^\\s\"'<>)]+|xiaohongshu\\.com\\/explore\\/[A-Fa-f0-9]+[^\\s\"'<>)]*)/g;
+                        const hits = new Set();
+                        const addStr = (s) => {
+                            if (!s) return;
+                            const m = String(s).match(regex);
+                            if (m) m.forEach(x => hits.add(x));
+                        };
+                        document.querySelectorAll('input, textarea').forEach(el => {
+                            addStr(el.value || '');
+                            addStr(el.outerHTML || '');
+                        });
+                        document.querySelectorAll('*').forEach(el => {
+                            if (!el.attributes) return;
+                            for (const a of el.attributes) {
+                                const name = a.name.toLowerCase();
+                                if (name.startsWith('data-') || name==='href' || name==='src' || /xsec|share|link|url|token/i.test(name)) {
+                                    addStr(a.value || '');
+                                }
+                            }
+                            const ch = el.childElementCount || 0;
+                            if (ch === 0) addStr(el.innerText || el.textContent || '');
+                        });
+                        const arr = Array.from(hits);
+                        arr.sort((a,b) => {
+                            const sa = (a.includes('xsec_token=') ? 2 : 0) + (a.includes('xhslink') ? 1 : 0);
+                            const sb = (b.includes('xsec_token=') ? 2 : 0) + (b.includes('xhslink') ? 1 : 0);
+                            return sb - sa;
+                        });
+                        return arr[0] || '';
+                    }""")
+                    dom_link_picked = _pick(dom_link)
+                    if dom_link_picked:
+                        link = dom_link_picked
+                        self.log(f"[分享链接] ✓ DOM全局提取(兜底1): {link}")
+                except Exception as e:
+                    self.log(f"[分享链接] DOM全局提取异常: {e}")
+
+            # 8. 兜底2：真实剪贴板读取（context 已授权 clipboard-read）
+            if clicked_ok and not link:
+                try:
+                    cb_raw = self._page.evaluate(
+                        "() => { try { return navigator.clipboard.readText(); } catch(e) { return ''; } }"
+                    )
+                    picked = _pick(cb_raw)
+                    if picked:
+                        link = picked
+                        self.log(f"[分享链接] ✓ 真实剪贴板(兜底2): {link}")
+                    else:
+                        if isinstance(cb_raw, str) and cb_raw:
+                            self.log(f"[分享链接] 剪贴板内容非分享链接: {repr(cb_raw[:150])}")
+                        else:
+                            self.log("[分享链接] 剪贴板为空")
+                except Exception as e:
+                    self.log(f"[分享链接] 剪贴板读取异常: {e}")
+
+            # 9. 关弹窗
+            try:
+                self._page.keyboard.press("Escape")
+                time.sleep(0.4)
+            except Exception:
+                pass
+
+            if link:
+                return link
+            if constructed:
+                self.log(f"[分享链接] 全部方案未命中 → 返回构造链接: {constructed}")
+                return constructed
+            return None
+
+        except Exception as e:
+            self.log(f"[分享链接] 最外层异常: {e}")
+            try:
+                self._page.keyboard.press("Escape")
+            except Exception:
+                pass
+            if constructed:
+                self.log(f"[分享链接] 异常 → 返回构造链接: {constructed}")
+                return constructed
             return None
 
     def _parse_chinese_time(self, time_text):
@@ -453,6 +880,29 @@ class XhsSpider:
             pass
         return 0
 
+    def _ensure_modal_closed(self):
+        """确保当前没有残留的笔记弹窗，避免干扰下一次点击。"""
+        try:
+            mask = self._page.query_selector(".note-detail-mask")
+            if mask and mask.is_visible():
+                self.log("[详情] 检测到残留弹窗，正在关闭...")
+                close_btn = self._page.query_selector(
+                    ".note-detail-mask .close-btn, .note-detail-mask .icon-close, "
+                    ".note-detail-mask [data-testid='close'], .note-detail-mask .m-close"
+                )
+                if close_btn and close_btn.is_visible():
+                    close_btn.click()
+                else:
+                    self._page.keyboard.press("Escape")
+                time.sleep(1)
+                # 再确认一次
+                mask2 = self._page.query_selector(".note-detail-mask")
+                if mask2 and mask2.is_visible():
+                    self._page.keyboard.press("Escape")
+                    time.sleep(0.5)
+        except Exception:
+            pass
+
     def _get_detail_by_card_index(self, card_index, search_note_data=None):
         cards = self._get_all_cards()
         if card_index >= len(cards):
@@ -470,29 +920,47 @@ class XhsSpider:
             self.log(f"[详情] ✗ 未找到第{card_index}个卡片")
             return None
 
+        # 点击前确保没有残留弹窗
+        self._ensure_modal_closed()
+
         card = cards[card_index]
 
-        try:
-            card.scroll_into_view_if_needed()
-            time.sleep(0.5)
-            card.click()
-        except Exception as e:
+        # 最多重试 2 次点击
+        for attempt in range(3):
             try:
-                self._page.evaluate("arguments[0].click()", card)
-                time.sleep(0.5)
-            except Exception:
-                self.log(f"[详情] ✗ 点击第{card_index}个卡片失败: {e}")
-                return None
+                card.scroll_into_view_if_needed()
+                time.sleep(0.8 + attempt * 0.5)  # 重试时等更久
+                card.click()
+            except Exception as e:
+                try:
+                    self._page.evaluate("arguments[0].click()", card)
+                    time.sleep(0.8)
+                except Exception:
+                    self.log(f"[详情] ✗ 点击第{card_index}个卡片失败: {e}")
+                    return None
 
-        try:
-            self._page.wait_for_selector(".note-detail-mask", timeout=8000)
-        except Exception:
-            self.log(f"[详情] ✗ 弹窗未出现")
             try:
-                self._page.keyboard.press("Escape")
+                self._page.wait_for_selector(".note-detail-mask", timeout=6000)
+                break  # 弹窗出现，跳出重试循环
             except Exception:
-                pass
-            return None
+                if attempt < 2:
+                    self.log(f"[详情] 第{card_index}个卡片第{attempt+1}次点击无弹窗，重试...")
+                    try:
+                        self._page.keyboard.press("Escape")
+                    except Exception:
+                        pass
+                    time.sleep(1)
+                    # 重新获取卡片引用（页面可能已刷新）
+                    cards = self._get_all_cards()
+                    if card_index < len(cards):
+                        card = cards[card_index]
+                else:
+                    self.log(f"[详情] ✗ 第{card_index}个卡片重试{attempt+1}次均无弹窗")
+                    try:
+                        self._page.keyboard.press("Escape")
+                    except Exception:
+                        pass
+                    return None
 
         time.sleep(2)
 
@@ -501,17 +969,23 @@ class XhsSpider:
             time.sleep(1)
             dom_data = self._extract_pubtime_tags_from_dom()
 
+        # 提前拿 note_id 传给分享链接兜底
+        note_id_for_share = (search_note_data.get("note_id", "") if search_note_data else "") or (dom_data.get("note_id", "") if dom_data else "")
+
+        # 获取分享链接（在弹窗关闭前）
+        share_link = self._get_share_link(note_id=note_id_for_share)
+
         try:
             close_btn = self._page.query_selector(".note-detail-mask .close-btn, .note-detail-mask .icon-close, .note-detail-mask [data-testid='close'], .note-detail-mask .m-close")
             if close_btn and close_btn.is_visible():
                 close_btn.click()
             else:
                 self._page.keyboard.press("Escape")
-            time.sleep(0.6)
+            time.sleep(1.0)  # 多等一下让页面恢复
         except Exception:
             try:
                 self._page.keyboard.press("Escape")
-                time.sleep(0.5)
+                time.sleep(0.8)
             except Exception:
                 pass
 
@@ -524,7 +998,8 @@ class XhsSpider:
         self.log(f"[DOM调试] date命中={dbg.get('date_found')} "
                  f"date_text='{dbg.get('date_text')}' "
                  f"tag数={dbg.get('tag_count')} "
-                 f"share_text='{dbg.get('share_text')}'")
+                 f"share_text='{dbg.get('share_text')}' "
+                 f"author_uid='{dom_data.get('author_user_id', '')}'")
 
         pub_time_sec = self._parse_chinese_time(dom_data.get('pub_time_text', ''))
         pub_time_ms = int(pub_time_sec * 1000) if pub_time_sec > 0 else 0
@@ -568,6 +1043,10 @@ class XhsSpider:
 
         note_id = search_note_data.get("note_id", "") if search_note_data else dom_data.get("note_id", "")
 
+        # 获取粉丝数：优先用 DOM 提取的 author_user_id，其次用 search_note_data 的 user_id
+        author_uid = dom_data.get("author_user_id", "") or (search_note_data.get("user_id", "") if search_note_data else "")
+        fans_count_val = self._fetch_fans_count(author_uid) if author_uid else 0
+
         detail = {
             "note_id": note_id,
             "title": search_note_data.get("title", "") if search_note_data else "",
@@ -578,8 +1057,8 @@ class XhsSpider:
             "share_count": share_count_final,
             "interact_count": interact,
             "nickname": search_note_data.get("nickname", "") if search_note_data else "",
-            "user_id": search_note_data.get("user_id", "") if search_note_data else "",
-            "fans_count": 0,
+            "user_id": author_uid,
+            "fans_count": fans_count_val,
             "pub_time": pub_time,
             "pub_time_ms": pub_time_ms,
             "note_type": search_note_data.get("note_type", "normal") if search_note_data else "normal",
@@ -587,11 +1066,12 @@ class XhsSpider:
             "note_age_hours": note_age_hours,
             "interact_velocity": interact_velocity,
             "engagement_score": engagement,
-            "url": f"https://www.xiaohongshu.com/explore/{note_id}" if note_id else "",
+            "share_link": share_link or "",
+            "url": share_link or "",  # DB 存储用
         }
 
         self.log(f"[详情] ✓ '{detail['title'][:30]}' "
-                 f"互动={interact} 赞={detail['liked_count']} 藏={detail['collected_count']} 评={detail['comment_count']}")
+                 f"互动={interact} 赞={detail['liked_count']} 藏={detail['collected_count']} 评={detail['comment_count']} 粉丝={fans_count_val}")
         return detail
 
     def get_note_detail(self, note_id, xsec_token="", note_index=0):
@@ -769,25 +1249,25 @@ class XhsSpider:
         self.log("")
         header = (
             f"{'排名':<4} {'标题':<30} {'互动量':>8} {'作者':<12} "
-            f"{'收藏率':>7} {'密度':>7} {'分享率':>7} {'评论率':>7} {'价值分':>7}"
+            f"{'收藏率':>7} {'密度':>7} {'评论率':>7} {'价值分':>7}"
         )
-        self.log("-" * 130)
+        self.log("-" * 120)
         self.log(header)
-        self.log("-" * 130)
+        self.log("-" * 120)
         for i, n in enumerate(results[:20], 1):
             title = (n["title"] or "")[:28]
             uploader = (n.get("nickname") or "")[:11]
             self.log(
                 f"{i:<4} {title:<30} {n['interact_count']:>8,} {uploader:<12} "
                 f"{n['collect_rate']:>7.3f} {n['engagement_score']:>7.3f} "
-                f"{n['share_rate']:>7.3f} {n['comment_rate']:>7.3f} "
+                f"{n['comment_rate']:>7.3f} "
                 f"{n['value_score']:>7.3f}"
             )
         if len(results) > 20:
             self.log(f"  ... 还有 {len(results) - 20} 条，完整结果请查看 CSV")
-        self.log("-" * 130)
-        self.log("提示: 价值分 = 收藏率(40%) + 互动密度(30%) + 分享率(15%) + 评论率(15%)")
-        self.log("      收藏率 = 收藏/点赞，代表内容被'保存'的深度价值")
+        self.log("-" * 120)
+        self.log("提示: 价值分 = 收藏率(40%) + 互动密度(30%) + 评论率(30%)")
+        self.log("      收藏率 = 收藏/点赞，互动密度 = 收藏/互动总量（越高=越多人深度保存）")
 
         if csv_file:
             self.db.export_value_csv(keyword, csv_file, results)

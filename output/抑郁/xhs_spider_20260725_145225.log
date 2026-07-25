@@ -1,0 +1,12 @@
+[2026-07-25 14:52:25.676] 日志文件: output\抑郁\xhs_spider_20260725_145225.log
+[2026-07-25 14:52:25.690] [任务] 创建任务#16: 关键词='抑郁', 页数=1, 排序=general
+[2026-07-25 14:52:27.326] [浏览器] 已注入 16 个 cookie
+[2026-07-25 14:52:27.571] [浏览器] Edge 浏览器已启动 (headless=True)
+[2026-07-25 14:52:27.574] [搜索] 关键词='抑郁' 第1页 排序=general
+[2026-07-25 14:52:37.197] [搜索] ✓ 返回 22 条笔记
+[2026-07-25 14:52:37.199] [任务] 第1页搜索到 22 条，累计 21 条
+[2026-07-25 14:52:37.200] [任务] 第1页：处理 21 条详情（1-21/21）...
+[2026-07-25 14:52:45.321] [分享链接] 弹窗调试: {'popup1': False, 'popup2': True, 'popup2_html': '<div data-v-0d218a15="" class="xhs-note-share-popup-header"><span data-v-0d218a15="" class="xhs-note-share-popup-title">分享至</span></div><div data-v-0d218a15="" class="xhs-note-share-popup-contacts"><div data-v-0d218a15="" class="xhs-note-share-popup-contacts-grid"><div data-v-0d218a15="" class="xhs-'}
+[2026-07-25 14:52:45.650] [分享链接] 点击联系人弹窗-复制链接按钮 ✓
+[2026-07-25 14:52:46.476] [分享链接] 剪贴板读取异常: Page.evaluate: NotAllowedError: Failed to execute 'readText' on 'Clipboard': Read permission denied.
+[2026-07-25 14:52:47.007] [分享链接] ✗ 剪贴板内容无效: raw=(空)

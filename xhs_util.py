@@ -368,7 +368,7 @@ class Database:
         cursor.execute("""
             SELECT n.note_id, n.title, n.interact_count, n.pub_time, n.nickname, n.user_id, n.fans_count,
                    n.interact_velocity, n.note_age_hours, n.engagement_score,
-                   n.comment_count, n.liked_count, n.collected_count, n.share_count, n.tags
+                   n.comment_count, n.liked_count, n.collected_count, n.share_count, n.tags, n.url
             FROM xhs_notes n
             JOIN spider_tasks t ON n.task_id = t.id
             WHERE t.keyword = ?
@@ -389,7 +389,13 @@ class Database:
                 conversions.append(float(n[2] or 0) / fans)
         max_conversion = max(conversions) if conversions else 1
 
-        engagements = [float(n[9]) for n in notes if n[9] and float(n[9]) > 0]
+        # 互动密度 = comment / interact，值域 0~1，有真实区分度
+        engagements = []
+        for n in notes:
+            interact = float(n[2] or 0)
+            comment = float(n[10] or 0)   # comment_count 在 index 10
+            if interact > 0:
+                engagements.append(comment / interact)
         max_engagement = max(engagements) if engagements else 1
 
         interacts = [float(n[2]) for n in notes if n[2]]
@@ -400,12 +406,15 @@ class Database:
         for note in notes:
             (note_id, title, interact_count, pub_time, nickname, user_id, fans_count,
              interact_velocity, note_age_hours, engagement_raw,
-             comment_count, liked_count, collected_count, share_count, tags_str) = note
+             comment_count, liked_count, collected_count, share_count, tags_str, url_str) = note
 
             interact_count = int(interact_count or 0)
             interact_velocity = float(interact_velocity or 0)
             note_age_hours = float(note_age_hours or 0)
-            engagement_raw = float(engagement_raw or 0)
+            comment_count_val = int(comment_count or 0)
+
+            # 互动密度 = 评论数 / 互动总量（0~1，有区分度）
+            engagement_raw = comment_count_val / max(interact_count, 1) if interact_count > 0 else 0
 
             velocity_score = min(interact_velocity / max_velocity, 1.0) if max_velocity > 0 else 0
 
@@ -451,7 +460,6 @@ class Database:
                 "comment_count": comment_count or 0,
                 "liked_count": liked_count or 0,
                 "collected_count": collected_count or 0,
-                "share_count": share_count or 0,
                 "velocity_score": round(velocity_score, 4),
                 "engagement_norm_score": round(engagement_score, 4),
                 "freshness_normalized": round(freshness_normalized, 4),
@@ -463,6 +471,7 @@ class Database:
                 "status_desc": "快照分析",
                 "total_growth_pct": historical_growth,
                 "tags": tags_str or "",
+                "share_link": url_str or "",
             }
             results.append(note_info)
 
@@ -471,19 +480,18 @@ class Database:
 
     def get_value_ranking(self, keyword, limit=50):
         """
-        价值分析：与动量分析互补，动量看"速度"，价值看"质量"。
-        5 维评分：
-        - 收藏率(35%): 收藏/点赞  →  内容被"保存"的意愿，代表深度价值
-        - 互动密度(25%): (赞+藏+评+享)/互动量
-        - 转化质量(20%): 互动量/粉丝 → 内容出圈能力
-        - 分享率(10%): 分享/点赞  → 传播意愿
-        - 评论率(10%): 评论/点赞  → 讨论热度
+        价值分析：与动量分析互补，动量看“速度”，价值看“质量”。
+        3 维评分：
+        - 收藏率(40%): 收藏/点赞  →  内容被“保存”的意愿，代表深度价值
+        - 互动密度(30%): 收藏/互动总量  →  深度保存占所有互动的比例
+        - 评论率(30%): 评论/点赞  →  讨论热度
+        注：分享率已废弃（小红书前端不展示分享数，恒为 0）
         """
         cursor = self.conn.cursor()
         cursor.execute("""
             SELECT n.note_id, n.title, n.interact_count, n.pub_time, n.nickname, n.user_id, n.fans_count,
                    n.note_age_hours, n.engagement_score, n.comment_count,
-                   n.liked_count, n.collected_count, n.share_count, n.tags
+                   n.liked_count, n.collected_count, n.share_count, n.tags, n.url
             FROM xhs_notes n
             JOIN spider_tasks t ON n.task_id = t.id
             WHERE t.keyword = ?
@@ -512,8 +520,8 @@ class Database:
                 share_rates.append(share / liked)
                 comment_rates.append(comment / liked)
             if interact > 0:
-                # 互动密度 = (赞+藏+评) / 互动总量，衡量高质量互动占比
-                engagements.append((liked + collected + comment) / interact)
+                # 互动密度 = 收藏 / 互动总量，代表"深度保存"占所有互动的比例
+                engagements.append(collected / interact)
 
         max_collect = max(collect_rates) if collect_rates else 1
         max_engage = max(engagements) if engagements else 1
@@ -524,7 +532,7 @@ class Database:
         for note in notes:
             (note_id, title, interact_count, pub_time, nickname, user_id, fans_count,
              note_age_hours, engagement_raw, comment_count,
-             liked_count, collected_count, share_count, tags_str) = note
+             liked_count, collected_count, share_count, tags_str, url_str) = note
 
             liked = int(liked_count or 0)
             collected = int(collected_count or 0)
@@ -535,7 +543,8 @@ class Database:
             collect_rate = collected / max(liked, 1) if liked > 0 else 0
             share_rate = share / max(liked, 1) if liked > 0 else 0
             comment_rate = comment / max(liked, 1) if liked > 0 else 0
-            engagement = engagement_raw or 0
+            # 互动密度：收藏占互动总量的比例（区间 0~1，有真实区分度）
+            engagement = collected / max(interact, 1) if interact > 0 else 0
 
             collect_score = min(collect_rate / max_collect, 1.0) if max_collect > 0 else 0
             engage_score = min(engagement / max_engage, 1.0) if max_engage > 0 else 0
@@ -545,8 +554,8 @@ class Database:
             value_score = (
                 collect_score * 0.40 +
                 engage_score * 0.30 +
-                share_score * 0.15 +
-                comment_score * 0.15
+                # share_score 恒为 0（小红书前端不展示分享数），权重合并至评论率
+                comment_score * 0.30
             )
 
             results.append({
@@ -557,20 +566,18 @@ class Database:
                 "user_id": user_id,
                 "liked_count": liked,
                 "collected_count": collected,
-                "share_count": share,
                 "comment_count": comment,
                 "tags": tags_str or "",
                 "collect_rate": round(collect_rate, 4),
                 "engagement_score": round(engagement, 4),
-                "share_rate": round(share_rate, 4),
                 "comment_rate": round(comment_rate, 4),
                 "collect_score": round(collect_score, 4),
                 "engage_score": round(engage_score, 4),
-                "share_score": round(share_score, 4),
                 "comment_score": round(comment_score, 4),
                 "value_score": round(value_score, 4),
                 "note_age_hours": note_age_hours or 0,
                 "pub_time": pub_time,
+                "share_link": url_str or "",
             })
 
         results.sort(key=lambda x: x["value_score"], reverse=True)
@@ -581,7 +588,7 @@ class Database:
         with open(csv_file, "w", encoding="utf-8-sig", newline="") as f:
             writer = csv.writer(f)
             writer.writerow([
-                "排名", "note_id", "标题", "互动量", "作者", "作者UID",
+                "排名", "note_id", "分享链接", "标题", "互动量", "作者", "作者UID",
                 "互动速率(次/小时)", "笔记年龄(小时)", "互动密度", "评论数", "标签",
                 "速率得分", "互动得分", "新鲜度得分", "互动量得分",
                 "历史增长%", "数据点数量", "发布时间", "综合评分"
@@ -590,6 +597,7 @@ class Database:
                 writer.writerow([
                     i,
                     item["note_id"],
+                    item.get("share_link", ""),
                     item["title"],
                     item.get("current_value", 0),
                     item.get("nickname", ""),
@@ -615,16 +623,17 @@ class Database:
         with open(csv_file, "w", encoding="utf-8-sig", newline="") as f:
             writer = csv.writer(f)
             writer.writerow([
-                "排名", "note_id", "标题", "互动量", "作者", "作者UID",
-                "点赞数", "收藏数", "评论数", "分享数",
-                "标签", "收藏率", "互动密度", "分享率", "评论率",
-                "收藏得分", "互动得分", "分享得分", "评论得分",
+                "排名", "note_id", "分享链接", "标题", "互动量", "作者", "作者UID",
+                "点赞数", "收藏数", "评论数",
+                "标签", "收藏率", "互动密度", "评论率",
+                "收藏得分", "互动得分", "评论得分",
                 "笔记年龄(小时)", "发布时间", "价值综合评分"
             ])
             for i, item in enumerate(results, 1):
                 writer.writerow([
                     i,
                     item["note_id"],
+                    item.get("share_link", ""),
                     item["title"],
                     item.get("interact_count", 0),
                     item.get("nickname", ""),
@@ -632,15 +641,12 @@ class Database:
                     item.get("liked_count", 0),
                     item.get("collected_count", 0),
                     item.get("comment_count", 0),
-                    item.get("share_count", 0),
                     item.get("tags", ""),
                     item.get("collect_rate", 0),
                     item.get("engagement_score", 0),
-                    item.get("share_rate", 0),
                     item.get("comment_rate", 0),
                     item.get("collect_score", 0),
                     item.get("engage_score", 0),
-                    item.get("share_score", 0),
                     item.get("comment_score", 0),
                     item.get("note_age_hours", 0),
                     item.get("pub_time", ""),
