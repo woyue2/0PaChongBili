@@ -662,9 +662,10 @@ class XhsSpider:
                     const m = href.match(/\/user\/profile\/([a-f0-9]+)/);
                     if (m) result.author_user_id = m[1];
                     try {
-                        result.author_url = new URL(href, location.origin).href;
+                        const profileUrl = new URL(href, location.origin);
+                        result.author_url = profileUrl.origin + profileUrl.pathname;
                     } catch (_) {
-                        result.author_url = href;
+                        result.author_url = href.split('?')[0].split('#')[0];
                     }
                 }
 

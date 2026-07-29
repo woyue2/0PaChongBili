@@ -87,8 +87,7 @@ class XhsDatabaseReliabilityTests(unittest.TestCase):
         self.assertEqual(len(food_results), 1)
         self.assertEqual(
             food_results[0]["author_url"],
-            "https://www.xiaohongshu.com/user/profile/user-1"
-            "?xsec_token=token",
+            "https://www.xiaohongshu.com/user/profile/user-1",
         )
         self.assertEqual(
             len(self.db.get_keyword_momentum_ranking("旅行")), 1

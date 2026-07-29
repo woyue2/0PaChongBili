@@ -709,9 +709,12 @@ class Database:
                 "pub_time": pub_time,
                 "nickname": nickname,
                 "user_id": user_id,
-                "author_url": author_url_str or (
-                    f"https://www.xiaohongshu.com/user/profile/{user_id}"
-                    if user_id else ""
+                "author_url": (
+                    (author_url_str or "").split("?", 1)[0].split("#", 1)[0]
+                    or (
+                        f"https://www.xiaohongshu.com/user/profile/{user_id}"
+                        if user_id else ""
+                    )
                 ),
                 "interact_velocity": round(interact_velocity, 2),
                 "engagement_score": round(engagement_raw, 4),
@@ -829,9 +832,12 @@ class Database:
                 "interact_count": interact,
                 "nickname": nickname,
                 "user_id": user_id,
-                "author_url": author_url_str or (
-                    f"https://www.xiaohongshu.com/user/profile/{user_id}"
-                    if user_id else ""
+                "author_url": (
+                    (author_url_str or "").split("?", 1)[0].split("#", 1)[0]
+                    or (
+                        f"https://www.xiaohongshu.com/user/profile/{user_id}"
+                        if user_id else ""
+                    )
                 ),
                 "liked_count": liked,
                 "collected_count": collected,
