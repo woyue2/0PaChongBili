@@ -1,5 +1,2 @@
-- bili
-python momentum_spider.py --popular -p 10 -t 5
-python value_spider.py --popular -p 10 -t 5
-python momentum_spider.py -k 跨越阶级 -p 10 -t 5
-python value_spider.py -k 穷人 -p 10 -t 5
+python src/bili/bili_main.py -m search -k 跨越阶级 -p 10
+python src/xhs/xhs_main.py search -k 美食 -p 3
