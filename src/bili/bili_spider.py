@@ -527,7 +527,7 @@ class BiliSpider:
                 self.log(f"  热门列表已到底，停止翻页"); break
         existing_ids = self.db.get_existing_av_ids()
         new_ids = list(all_av_ids - existing_ids)
-        self.log(f"\n[搜索完成] 共 {len(all_av_ids)} 个视频，已有 {len(all_av_ids) - len(new_ids)} 个，新增 {len(new_ids)} 个")
+        self.log(f"\n[任务] 本次抓取：{len(all_av_ids)} 条视频，已有 {len(all_av_ids) - len(new_ids)} 条，新增 {len(new_ids)} 条")
         self.log(f"[搜索统计] 失败页数: {len(failed_pages)}")
         if not new_ids:
             self.log("[完成] 没有新视频需要爬取")
@@ -557,7 +557,7 @@ class BiliSpider:
             time.sleep(random.uniform(self.args.delay, self.args.delay + 1))
         existing_ids = self.db.get_existing_av_ids()
         new_ids = list(all_av_ids - existing_ids)
-        self.log(f"\n[搜索完成] 共 {len(all_av_ids)} 个视频，今日已爬 {len(all_av_ids) - len(new_ids)} 个，新增 {len(new_ids)} 个")
+        self.log(f"\n[任务] 本次抓取：{len(all_av_ids)} 条视频，今日已爬 {len(all_av_ids) - len(new_ids)} 条，新增 {len(new_ids)} 条")
         self.log(f"[搜索统计] 搜索失败页数: {len(failed_pages)}")
         if not new_ids:
             self.log("[完成] 没有新视频需要爬取")
@@ -580,6 +580,7 @@ class BiliSpider:
         ranking = self.db.get_keyword_momentum_ranking(keyword, metric, limit)
         if not ranking:
             self.log("[动量分析] 无数据可分析"); return
+        self.log(f"[动量分析] 范围：关键词累计库，共 {len(ranking)} 条视频")
         self.log(f"\n动量排行 Top {limit}（按综合评分排序）")
         self.log("-" * 180)
         header = (f"{'排名':<4} {'标题':<28} {'播放量':>10} {'UP主':<10} {'粉丝':>8} "
@@ -719,6 +720,7 @@ class BiliSpider:
     def _print_value_ranking(self, videos, keyword):
         self.log(f"\n{'=' * 100}\n  价值分析 (独立评分)\n{'=' * 100}")
         self.log(f"关键词: {keyword}")
+        self.log(f"[价值分析] 范围：关键词累计库，共 {len(videos)} 条视频")
         self.log(f"评分维度: 深度互动比(35%) + 互动密度(25%) + 收藏率(20%) + 粉丝转化(10%) + 分享率(10%)")
         self.log(f"说明: 价值评分衡量视频的长期内容质量，不受视频年龄/新鲜度影响\n")
         limit = min(self.args.limit if hasattr(self.args, 'limit') else 999999, len(videos))

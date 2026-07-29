@@ -2,11 +2,14 @@
 douyin_spider.py - 抖音爬虫主类
 基于 Playwright 监听 API 响应模式，浏览器自动签名，无需维护 X-Bogus 算法。
 搜索接口: /aweme/v1/web/search/item/
+搜索URL格式: https://www.douyin.com/search/{keyword}?aid={uuid}&type=general
 """
 
 import time
 import random
 import os
+import sys
+import uuid
 import threading
 from datetime import datetime
 from urllib.parse import quote
@@ -62,7 +65,7 @@ class DouyinSpider:
         if self.output_dir:
             log_dir = self.output_dir
         else:
-            log_dir = paths.logs("douyin")
+            log_dir = paths.DOUYIN_LOGS  # 使用 logs/dy/ 目录
         os.makedirs(log_dir, exist_ok=True)
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         self.log_file = os.path.join(log_dir, f"douyin_spider_{timestamp}.log")
@@ -71,7 +74,12 @@ class DouyinSpider:
     def log(self, message):
         timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
         log_line = f"[{timestamp}] {message}"
-        print(log_line)
+        try:
+            print(log_line)
+        except UnicodeEncodeError:
+            console_encoding = getattr(sys.stdout, "encoding", None) or "utf-8"
+            safe_line = log_line.encode(console_encoding, errors="replace").decode(console_encoding)
+            print(safe_line)
         try:
             with open(self.log_file, "a", encoding="utf-8") as f:
                 f.write(log_line + "\n")
@@ -128,16 +136,19 @@ class DouyinSpider:
 
     def _on_response(self, response):
         url = response.url
-        if "/aweme/v1/web/" not in url:
+        # 放宽过滤条件，捕获所有 douyin.com 的 API 响应
+        if "douyin.com" not in url or response.status != 200:
             return
         try:
             body = response.json()
-            with self._api_lock:
-                self._api_responses.append({
-                    "url": url,
-                    "status": response.status,
-                    "body": body,
-                })
+            # 只记录有意义的 API 响应（包含 aweme 或 search 关键字）
+            if "aweme" in url or "search" in url or "item" in url:
+                with self._api_lock:
+                    self._api_responses.append({
+                        "url": url,
+                        "status": response.status,
+                        "body": body,
+                    })
         except Exception:
             pass
 
@@ -161,10 +172,24 @@ class DouyinSpider:
                 if path_keyword in r["url"]:
                     body = r["body"]
                     if isinstance(body, dict):
+                        # 支持多种数据结构
                         data = body.get("data", {})
                         if isinstance(data, dict) and "aweme_list" in data:
                             return r
+                        if isinstance(data, list) and len(data) > 0:
+                            return r
         return None
+
+    def _debug_api_urls(self):
+        """调试用：打印所有捕获的 API URL"""
+        with self._api_lock:
+            urls = [r["url"].split("?")[0] for r in self._api_responses]
+            if urls:
+                self.log(f"[调试] 已捕获 {len(urls)} 个 API 响应:")
+                for u in urls[:10]:
+                    self.log(f"  - {u}")
+            else:
+                self.log("[调试] 未捕获任何 API 响应")
 
     def _close_playwright(self):
         with self._pw_lock:
@@ -203,14 +228,27 @@ class DouyinSpider:
 
     def _parse_search_items(self, aweme_list):
         results = []
-        for aweme in aweme_list:
-            aweme_id = aweme.get("aweme_id", "")
+        skipped = 0
+        for idx, item in enumerate(aweme_list):
+            # 抖音搜索 API 返回的是嵌套结构: {aweme_info: {...}}
+            aweme_info = item.get("aweme_info", item)
+            
+            aweme_id = aweme_info.get("aweme_id", "")
             if not aweme_id:
+                skipped += 1
                 continue
 
-            author = aweme.get("author", {}) or {}
-            statistics = aweme.get("statistics", {}) or {}
-            video = aweme.get("video", {}) or {}
+            author = aweme_info.get("author", {}) or {}
+            video = aweme_info.get("video", {}) or {}
+
+            # statistics 可能在 item 外层 或 aweme_info 内层
+            statistics = item.get("statistics") or aweme_info.get("statistics") or {}
+            
+            # 调试：打印第一个记录的结构
+            if idx == 0 and len(results) == 0:
+                self.log(f"[调试] item keys: {list(item.keys())}")
+                self.log(f"[调试] aweme_info keys: {list(aweme_info.keys())}")
+                self.log(f"[调试] statistics: {str(statistics)[:300]}")
 
             digg_count = int(statistics.get("digg_count", 0))
             comment_count = int(statistics.get("comment_count", 0))
@@ -218,10 +256,26 @@ class DouyinSpider:
             collect_count = int(statistics.get("collect_count", 0))
             play_count = int(statistics.get("play_count", 0))
 
+            # 如果所有统计都是 0，尝试从其他字段获取
+            if digg_count == 0 and comment_count == 0 and share_count == 0 and play_count == 0:
+                # 检查是否在其他位置
+                if "digg_count" in item:
+                    digg_count = int(item.get("digg_count", 0))
+                    comment_count = int(item.get("comment_count", 0))
+                    share_count = int(item.get("share_count", 0))
+                    play_count = int(item.get("play_count", 0))
+
             interact_count = digg_count + comment_count + share_count + collect_count
 
-            title = aweme.get("desc", "")
-            create_time = int(aweme.get("create_time", 0))
+            title = aweme_info.get("desc", "")
+            create_time = int(aweme_info.get("create_time", 0))
+            
+            # 计算视频年龄（小时）
+            now_ts = int(time.time())
+            note_age_hours = (now_ts - create_time) / 3600 if create_time > 0 else 0
+            
+            # 计算互动速率（互动数/小时）
+            interact_velocity = interact_count / max(note_age_hours, 0.1) if interact_count > 0 else 0
 
             play_addr = ""
             video_urls = video.get("play_addr", {}).get("url_list", [])
@@ -231,7 +285,7 @@ class DouyinSpider:
             results.append({
                 "aweme_id": aweme_id,
                 "title": title,
-                "description": aweme.get("desc", ""),
+                "description": aweme_info.get("desc", ""),
                 "play_count": play_count,
                 "liked_count": digg_count,
                 "comment_count": comment_count,
@@ -241,44 +295,144 @@ class DouyinSpider:
                 "nickname": author.get("nickname", ""),
                 "user_id": author.get("unique_id", "") or str(author.get("user_id", "")),
                 "sec_uid": author.get("sec_uid", ""),
-                "create_time": create_time,
+                "pub_time": create_time,  # 数据库字段名是 pub_time
+                "note_age_hours": note_age_hours,
+                "interact_velocity": interact_velocity,
+                "engagement_score": interact_count,  # 用互动总数做初始评分
                 "video_url": play_addr,
-                "note_type": aweme.get("aweme_type", 0),
+                "note_type": aweme_info.get("aweme_type", 0),
                 "source": "search",
             })
+        
+        if skipped > 0:
+            self.log(f"[调试] 跳过 {skipped} 条无 aweme_id 的记录")
         return results
 
     def search_videos(self, keyword, page=1, sort="general"):
         self._ensure_playwright()
         self._clear_api()
 
-        search_url = f"https://www.douyin.com/search/{quote(keyword)}?type=video"
+        self.log(f"[搜索] 打开抖音首页...")
+        self._page.goto("https://www.douyin.com/", wait_until="domcontentloaded", timeout=30000)
+        self._page.wait_for_timeout(3000)
+
+        # 检查是否弹出登录框等
+        try:
+            # 关闭可能的弹窗
+            close_btn = self._page.query_selector("button[class*='close'], div[class*='modal'] button")
+            if close_btn:
+                close_btn.click()
+                self._page.wait_for_timeout(500)
+        except Exception:
+            pass
+
         self.log(f"[搜索] 关键词='{keyword}' 第{page}页")
-        self._page.goto(search_url, wait_until="domcontentloaded", timeout=30000)
+
+        # 模拟用户：在搜索框输入关键词并搜索
+        try:
+            # 找到搜索输入框
+            search_input = self._page.query_selector("input[type='text']")
+            if not search_input:
+                search_input = self._page.query_selector("input[placeholder*='搜索']")
+            if not search_input:
+                search_input = self._page.query_selector("[data-e2e='search-input']")
+            
+            if search_input:
+                # 清空并输入关键词
+                search_input.click()
+                self._page.wait_for_timeout(300)
+                search_input.fill("")
+                search_input.fill(keyword)
+                self._page.wait_for_timeout(500)
+                
+                # 点击搜索按钮或按Enter
+                try:
+                    search_btn = self._page.query_selector("button[class*='search']")
+                    if search_btn:
+                        search_btn.click()
+                    else:
+                        self._page.keyboard.press("Enter")
+                except Exception:
+                    self._page.keyboard.press("Enter")
+                
+                self.log(f"[搜索] 已输入关键词并点击搜索")
+            else:
+                # 如果找不到搜索框，尝试直接跳转
+                self.log(f"[搜索] 未找到搜索框，尝试直接跳转...")
+                search_url = f"https://www.douyin.com/search/{quote(keyword)}?type=general"
+                self._page.goto(search_url, wait_until="domcontentloaded", timeout=30000)
+
+        except Exception as e:
+            self.log(f"[搜索] 搜索操作异常: {e}")
+            # 降级方案：直接跳转
+            search_url = f"https://www.douyin.com/search/{quote(keyword)}?type=general"
+            self._page.goto(search_url, wait_until="domcontentloaded", timeout=30000)
+
+        # 等待页面跳转和加载
         self._page.wait_for_timeout(5000)
 
-        for i in range(2):
+        # 滚动触发加载
+        for i in range(3):
             try:
-                self._page.evaluate(f"window.scrollTo(0, {500 + i * 400})")
+                self._page.evaluate(f"window.scrollTo(0, {300 + i * 500})")
             except Exception:
                 pass
-            self._page.wait_for_timeout(1500)
+            self._page.wait_for_timeout(2000)
 
+        # 调试：查看捕获的 API
+        self._debug_api_urls()
+
+        # 尝试多种 API 路径
         resp = self._find_api_with_items("search/item")
         if not resp:
+            resp = self._find_api_with_items("search")
+        if not resp:
+            self.log("[搜索] 尝试等待更多 API 响应...")
+            self._page.wait_for_timeout(3000)
+            self._debug_api_urls()
+            resp = self._find_api_with_items("item")
+
+        if not resp:
             self.log(f"[搜索] ✗ 未捕获到搜索 API")
+            self.log(f"[调试] 当前页面 URL: {self._page.url}")
+            self.log(f"[调试] 当前页面标题: {self._page.title()}")
             return []
 
         body = resp["body"]
-        if body.get("status_code") != 0:
-            self.log(f"[搜索] ✗ API 错误: status_code={body.get('status_code')}")
+        self.log(f"[搜索] 捕获到 API: {resp['url'].split('?')[0]}")
+
+        # 兼容不同响应结构
+        data = body.get("data", {})
+        aweme_list = []
+        if isinstance(data, dict):
+            aweme_list = data.get("aweme_list", []) or []
+            if not aweme_list:
+                # 尝试其他可能的字段名
+                for key in ["aweme_detail", "items", "list"]:
+                    if key in data and isinstance(data[key], list):
+                        aweme_list = data[key]
+                        self.log(f"[调试] 使用 data.{key} 字段")
+                        break
+        elif isinstance(data, list):
+            aweme_list = data
+
+        if not aweme_list:
+            self.log(f"[搜索] ✗ API 返回数据为空")
+            self.log(f"[调试] API 响应结构: {list(body.keys())}")
+            self.log(f"[调试] data 类型: {type(data).__name__}, data keys: {list(data.keys()) if isinstance(data, dict) else 'N/A'}")
+            # 打印 body 的部分内容
+            self.log(f"[调试] body 预览: {str(body)[:500]}")
             return []
 
-        data = body.get("data", {})
-        aweme_list = data.get("aweme_list", []) or []
         self.log(f"[搜索] ✓ 返回 {len(aweme_list)} 条视频")
-
-        return self._parse_search_items(aweme_list)
+        
+        # 调试：解析前后的对比
+        parsed = self._parse_search_items(aweme_list)
+        self.log(f"[调试] 解析后: {len(parsed)} 条有效数据")
+        if parsed:
+            self.log(f"[调试] 第一条数据: aweme_id={parsed[0]['aweme_id']}, title={parsed[0]['title'][:30]}")
+        
+        return parsed
 
     def _scroll_load_more(self, max_scrolls=5):
         self._clear_api()
@@ -287,7 +441,44 @@ class DouyinSpider:
 
         for s in range(max_scrolls):
             try:
+                # 尝试多种滚动方式
+                # 1. 滚动 body
                 self._page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+                self._page.wait_for_timeout(500)
+                
+                # 2. 尝试滚动搜索结果容器
+                scroll_containers = self._page.query_selector_all('[data-e2e="search-result-container"], .search-result-container, [class*="feed"]')
+                for container in scroll_containers:
+                    try:
+                        self._page.evaluate("(arguments[0]).scrollTop = (arguments[0]).scrollHeight", container)
+                        break
+                    except Exception:
+                        pass
+                
+                # 3. 模拟键盘 Page Down
+                self._page.keyboard.press("End")
+                self._page.wait_for_timeout(1000)
+                
+                # 点击第一个视频卡片，触发懒加载
+                video_cards = self._page.query_selector_all('[data-e2e="search-card"]')
+                if not video_cards:
+                    video_cards = self._page.query_selector_all('.search-card, [class*="video-card"]')
+                if video_cards:
+                    try:
+                        # 滚动到卡片可见
+                        video_cards[0].scroll_into_view()
+                        self._page.wait_for_timeout(500)
+                        video_cards[0].click()
+                        self._page.wait_for_timeout(2000)
+                        # 按 ESC 或点击返回按钮回到搜索结果
+                        self._page.keyboard.press("Escape")
+                        self._page.wait_for_timeout(1000)
+                    except Exception:
+                        pass
+                
+                # 再次滚动
+                self._page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+                self._page.keyboard.press("End")
             except Exception:
                 pass
             self._page.wait_for_timeout(3000)
@@ -345,7 +536,7 @@ class DouyinSpider:
 
             self.log(f"[任务] 第{page}页: 新增 {new_count} 条，累计 {len(all_videos)} 条")
 
-        self.log(f"[任务] 共爬取 {len(all_videos)} 条视频")
+        self.log(f"[任务] 本次抓取：{len(all_videos)} 条视频")
 
         for v in all_videos:
             v["category"] = keyword
@@ -400,11 +591,11 @@ class DouyinSpider:
             self.log(f"[动量分析] 无数据，请先爬取关键词: {keyword}")
             return []
 
-        self.log(f"[动量分析] 共 {len(results)} 条视频")
+        self.log(f"[动量分析] 范围：关键词累计库，共 {len(results)} 条视频")
         self.log("")
         header = (
-            f"{'排名':<4} {'标题':<30} {'播放量':>10} {'作者':<12} "
-            f"{'速率/h':>8} {'密度':>7} {'年龄(h)':>8} {'综合分':>7}"
+            f"{'排名':<4} {'标题':<30} {'互动总数':>10} {'作者':<12} "
+            f"{'速率/h':>8} {'密度分':>7} {'年龄(h)':>8} {'综合分':>7}"
         )
         self.log("-" * 120)
         self.log(header)
@@ -413,14 +604,14 @@ class DouyinSpider:
             title = (n["title"] or "")[:28]
             uploader = (n.get("nickname") or "")[:11]
             self.log(
-                f"{i:<4} {title:<30} {n['current_value']:>10,} {uploader:<12} "
-                f"{n['interact_velocity']:>8.0f} {n['engagement_score']:>7.3f} "
+                f"{i:<4} {title:<30} {n['total_interact']:>10,} {uploader:<12} "
+                f"{n['interact_velocity']:>8.0f} {n['density_score']:>7.3f} "
                 f"{n['note_age_hours']:>8.1f} {n['composite_score']:>7.3f}"
             )
         if len(results) > 20:
             self.log(f"  ... 还有 {len(results) - 20} 条，完整结果请查看 CSV")
         self.log("-" * 120)
-        self.log("提示: 综合分 = 速率(35%) + 密度(30%) + 新鲜(20%) + 播放量(15%)")
+        self.log("提示: 综合分 = 速率(35%) + 密度(30%) + 新鲜度(20%) + 评论活跃度(15%)")
 
         if csv_file:
             self.db.export_momentum_csv(keyword, csv_file, results)
@@ -434,11 +625,11 @@ class DouyinSpider:
             self.log(f"[价值分析] 无数据，请先爬取关键词: {keyword}")
             return []
 
-        self.log(f"[价值分析] 共 {len(results)} 条视频")
+        self.log(f"[价值分析] 范围：关键词累计库，共 {len(results)} 条视频")
         self.log("")
         header = (
-            f"{'排名':<4} {'标题':<30} {'播放量':>10} {'作者':<12} "
-            f"{'收藏率':>7} {'密度':>7} {'评论率':>7} {'价值分':>7}"
+            f"{'排名':<4} {'标题':<30} {'互动总数':>10} {'作者':<12} "
+            f"{'收藏率':>7} {'分享率':>7} {'评论率':>7} {'价值分':>7}"
         )
         self.log("-" * 120)
         self.log(header)
@@ -447,15 +638,15 @@ class DouyinSpider:
             title = (n["title"] or "")[:28]
             uploader = (n.get("nickname") or "")[:11]
             self.log(
-                f"{i:<4} {title:<30} {n['play_count']:>10,} {uploader:<12} "
-                f"{n['collect_rate']:>7.3f} {n['engagement_score']:>7.3f} "
+                f"{i:<4} {title:<30} {n['total_interact']:>10,} {uploader:<12} "
+                f"{n['collect_rate']:>7.3f} {n['share_rate']:>7.3f} "
                 f"{n['comment_rate']:>7.3f} "
                 f"{n['value_score']:>7.3f}"
             )
         if len(results) > 20:
             self.log(f"  ... 还有 {len(results) - 20} 条，完整结果请查看 CSV")
         self.log("-" * 120)
-        self.log("提示: 价值分 = 收藏率(40%) + 互动密度(30%) + 评论率(30%)")
+        self.log("提示: 价值分 = 收藏率(35%) + 分享率(25%) + 评论率(20%) + 互动率(20%)")
 
         if csv_file:
             self.db.export_value_csv(keyword, csv_file, results)

@@ -364,6 +364,13 @@ class Database:
             return 0.8
 
     def get_keyword_momentum_ranking(self, keyword, limit=20):
+        """
+        抖音动量分析算法（适配无播放量场景）：
+        - 互动速率(35%)：互动数/小时
+        - 互动密度(30%)：互动总数（点赞+评论+分享+收藏）
+        - 新鲜度(20%)：发布时间远近
+        - 评论活跃度(15%)：评论数/互动总数
+        """
         cursor = self.conn.cursor()
         cursor.execute("""
             SELECT n.aweme_id, n.title, n.play_count, n.pub_time, n.nickname, n.user_id, n.fans_count,
@@ -372,95 +379,110 @@ class Database:
             FROM dy_notes n
             JOIN spider_tasks t ON n.task_id = t.id
             WHERE t.keyword = ?
-            ORDER BY n.play_count DESC
         """, (keyword,))
         notes = cursor.fetchall()
 
         if not notes:
             return []
 
-        velocities = [float(n[7]) for n in notes if n[7] and float(n[7]) > 0]
-        max_velocity = max(velocities) if velocities else 1
-
-        engagements = []
+        # 计算每个视频的互动总数和各项指标
+        note_metrics = []
         for n in notes:
-            play = float(n[2] or 0)
-            comment = float(n[10] or 0)
-            if play > 0:
-                engagements.append(comment / play)
-        max_engagement = max(engagements) if engagements else 1
-
-        plays = [float(n[2]) for n in notes if n[2]]
-        max_play = max(plays) if plays else 1
-        min_play = min(plays) if plays else 0
-
-        results = []
-        for note in notes:
             (aweme_id, title, play_count, pub_time, nickname, user_id, fans_count,
              interact_velocity, note_age_hours, engagement_raw,
-             comment_count, liked_count, share_count, collected_count, tags_str, video_url) = note
+             comment_count, liked_count, share_count, collected_count, tags_str, video_url) = n
+            
+            liked = int(liked_count or 0)
+            comment = int(comment_count or 0)
+            share = int(share_count or 0)
+            collect = int(collected_count or 0)
+            total_interact = liked + comment + share + collect
+            
+            note_metrics.append({
+                "data": n,
+                "total_interact": total_interact,
+                "liked": liked,
+                "comment": comment,
+                "share": share,
+                "collect": collect,
+                "interact_velocity": float(interact_velocity or 0),
+                "note_age_hours": float(note_age_hours or 0),
+            })
 
-            play_count = int(play_count or 0)
-            interact_velocity = float(interact_velocity or 0)
-            note_age_hours = float(note_age_hours or 0)
-            comment_count_val = int(comment_count or 0)
+        # 归一化计算
+        max_velocity = max(m["interact_velocity"] for m in note_metrics) or 1
+        max_interact = max(m["total_interact"] for m in note_metrics) or 1
+        max_comment_ratio = max((
+            m["comment"] / max(m["total_interact"], 1) 
+            for m in note_metrics 
+            if m["comment"] > 0
+        ), default=0) or 1
 
-            engagement_raw = comment_count_val / max(play_count, 1) if play_count > 0 else 0
+        results = []
+        for m in note_metrics:
+            n = m["data"]
+            (aweme_id, title, play_count, pub_time, nickname, user_id, fans_count,
+             interact_velocity, note_age_hours, engagement_raw,
+             comment_count, liked_count, share_count, collected_count, tags_str, video_url) = n
 
+            liked = m["liked"]
+            comment = m["comment"]
+            share = m["share"]
+            collect = m["collect"]
+            total_interact = m["total_interact"]
+            interact_velocity = m["interact_velocity"]
+            note_age_hours = m["note_age_hours"]
+            
+            # 1. 互动速率得分 (35%)
             velocity_score = min(interact_velocity / max_velocity, 1.0) if max_velocity > 0 else 0
-            engagement_score = min(engagement_raw / max_engagement, 1.0) if max_engagement > 0 else 0
-
-            note_age_days = note_age_hours / 24 if note_age_hours > 0 else None
+            
+            # 2. 互动密度得分 (30%)
+            density_score = min(total_interact / max_interact, 1.0) if max_interact > 0 else 0
+            
+            # 3. 新鲜度得分 (20%)
+            note_age_days = note_age_hours / 24 if note_age_hours > 0 else 30
             freshness = self.calculate_freshness_weight(note_age_days)
-            freshness_normalized = (freshness - 0.8) / (2.0 - 0.8)
-
-            normalized_value = (play_count - min_play) / (max_play - min_play) if max_play > min_play else 0.5
-
+            freshness_score = (freshness - 0.8) / (2.0 - 0.8)
+            freshness_score = max(0, min(1, freshness_score))
+            
+            # 4. 评论活跃度得分 (15%)
+            comment_ratio = comment / max(total_interact, 1) if total_interact > 0 else 0
+            comment_activity_score = min(comment_ratio / max_comment_ratio, 1.0) if max_comment_ratio > 0 else 0
+            
+            # 综合评分
             composite_score = (
                 velocity_score * 0.35 +
-                engagement_score * 0.30 +
-                freshness_normalized * 0.20 +
-                normalized_value * 0.15
+                density_score * 0.30 +
+                freshness_score * 0.20 +
+                comment_activity_score * 0.15
             )
 
-            historical_growth = None
-            data_points = 1
-            try:
-                h_cursor = self.conn.cursor()
-                h_cursor.execute("SELECT COUNT(*) FROM note_history WHERE aweme_id = ?", (aweme_id,))
-                data_points = h_cursor.fetchone()[0] or 1
-                if data_points >= 2:
-                    h_cursor.execute("SELECT play_count FROM note_history WHERE aweme_id = ? ORDER BY record_time ASC", (aweme_id,))
-                    history = [float(r[0]) for r in h_cursor.fetchall()]
-                    if history and history[0] > 0:
-                        historical_growth = round((history[-1] - history[0]) / history[0] * 100, 2)
-            except Exception:
-                pass
+            # 时间转换
+            pub_time_str = ""
+            if pub_time and int(pub_time) > 0:
+                try:
+                    pub_time_str = datetime.fromtimestamp(int(pub_time)).strftime("%Y-%m-%d %H:%M")
+                except:
+                    pub_time_str = str(pub_time)
 
             note_info = {
                 "aweme_id": aweme_id,
                 "title": title,
-                "current_value": play_count,
-                "pub_time": pub_time,
+                "total_interact": total_interact,
+                "pub_time": pub_time_str,
                 "nickname": nickname,
                 "user_id": user_id,
                 "interact_velocity": round(interact_velocity, 2),
-                "engagement_score": round(engagement_raw, 4),
                 "note_age_hours": round(note_age_hours, 1),
-                "comment_count": comment_count or 0,
-                "liked_count": liked_count or 0,
-                "share_count": share_count or 0,
-                "collected_count": collected_count or 0,
+                "comment_count": comment,
+                "liked_count": liked,
+                "share_count": share,
+                "collected_count": collect,
                 "velocity_score": round(velocity_score, 4),
-                "engagement_norm_score": round(engagement_score, 4),
-                "freshness_normalized": round(freshness_normalized, 4),
-                "normalized_value": round(normalized_value, 4),
+                "density_score": round(density_score, 4),
+                "freshness_score": round(freshness_score, 4),
+                "comment_activity_score": round(comment_activity_score, 4),
                 "composite_score": round(composite_score, 4),
-                "data_points": data_points,
-                "historical_growth_pct": historical_growth,
-                "status": "snapshot",
-                "status_desc": "快照分析",
-                "total_growth_pct": historical_growth,
                 "tags": tags_str or "",
                 "video_url": video_url or "",
             }
@@ -470,6 +492,13 @@ class Database:
         return results[:limit]
 
     def get_value_ranking(self, keyword, limit=50):
+        """
+        抖音价值分析算法（适配无播放量场景）：
+        - 收藏率(35%)：收藏/点赞（衡量内容持久价值）
+        - 分享率(25%)：分享/点赞（衡量传播价值）
+        - 评论率(20%)：评论/点赞（衡量互动深度）
+        - 互动率(20%)：(收藏+评论+分享)/点赞（衡量综合吸引力）
+        """
         cursor = self.conn.cursor()
         cursor.execute("""
             SELECT n.aweme_id, n.title, n.play_count, n.pub_time, n.nickname, n.user_id, n.fans_count,
@@ -478,86 +507,101 @@ class Database:
             FROM dy_notes n
             JOIN spider_tasks t ON n.task_id = t.id
             WHERE t.keyword = ?
-              AND n.liked_count > 0
-            ORDER BY n.play_count DESC
         """, (keyword,))
         notes = cursor.fetchall()
 
         if not notes:
             return []
 
-        collect_rates = []
-        engagements = []
-        share_rates = []
-        comment_rates = []
-
+        # 计算每个视频的指标
+        note_metrics = []
         for n in notes:
-            liked = int(n[10] or 0)
-            collected = int(n[11] or 0)
-            share = int(n[12] or 0)
-            comment = int(n[9] or 0)
-            play = int(n[2] or 0)
-
-            if liked > 0:
-                collect_rates.append(collected / liked)
-                share_rates.append(share / liked)
-                comment_rates.append(comment / liked)
-            if play > 0:
-                engagements.append(collected / play)
-
-        max_collect = max(collect_rates) if collect_rates else 1
-        max_engage = max(engagements) if engagements else 1
-        max_share = max(share_rates) if share_rates else 1
-        max_comment = max(comment_rates) if comment_rates else 1
-
-        results = []
-        for note in notes:
             (aweme_id, title, play_count, pub_time, nickname, user_id, fans_count,
              note_age_hours, engagement_raw, comment_count,
-             liked_count, collected_count, share_count, tags_str, video_url) = note
+             liked_count, collected_count, share_count, tags_str, video_url) = n
 
             liked = int(liked_count or 0)
             collected = int(collected_count or 0)
             share = int(share_count or 0)
             comment = int(comment_count or 0)
-            play = int(play_count or 0)
+            total_interact = liked + collected + share + comment
 
+            # 计算各项比率（以点赞为基准）
             collect_rate = collected / max(liked, 1) if liked > 0 else 0
             share_rate = share / max(liked, 1) if liked > 0 else 0
             comment_rate = comment / max(liked, 1) if liked > 0 else 0
-            engagement = collected / max(play, 1) if play > 0 else 0
+            interact_rate = (collected + share + comment) / max(liked, 1) if liked > 0 else 0
 
-            collect_score = min(collect_rate / max_collect, 1.0) if max_collect > 0 else 0
-            engage_score = min(engagement / max_engage, 1.0) if max_engage > 0 else 0
-            share_score = min(share_rate / max_share, 1.0) if max_share > 0 else 0
-            comment_score = min(comment_rate / max_comment, 1.0) if max_comment > 0 else 0
+            note_metrics.append({
+                "data": n,
+                "liked": liked,
+                "collected": collected,
+                "share": share,
+                "comment": comment,
+                "total_interact": total_interact,
+                "collect_rate": collect_rate,
+                "share_rate": share_rate,
+                "comment_rate": comment_rate,
+                "interact_rate": interact_rate,
+            })
 
+        # 归一化计算
+        max_collect_rate = max(m["collect_rate"] for m in note_metrics) or 1
+        max_share_rate = max(m["share_rate"] for m in note_metrics) or 1
+        max_comment_rate = max(m["comment_rate"] for m in note_metrics) or 1
+        max_interact_rate = max(m["interact_rate"] for m in note_metrics) or 1
+
+        results = []
+        for m in note_metrics:
+            n = m["data"]
+            (aweme_id, title, play_count, pub_time, nickname, user_id, fans_count,
+             note_age_hours, engagement_raw, comment_count,
+             liked_count, collected_count, share_count, tags_str, video_url) = n
+
+            # 得分计算
+            collect_score = min(m["collect_rate"] / max_collect_rate, 1.0)
+            share_score = min(m["share_rate"] / max_share_rate, 1.0)
+            comment_score = min(m["comment_rate"] / max_comment_rate, 1.0)
+            interact_score = min(m["interact_rate"] / max_interact_rate, 1.0)
+
+            # 价值综合评分
             value_score = (
-                collect_score * 0.40 +
-                engage_score * 0.30 +
-                comment_score * 0.30
+                collect_score * 0.35 +
+                share_score * 0.25 +
+                comment_score * 0.20 +
+                interact_score * 0.20
             )
+
+            # 时间转换
+            pub_time_str = ""
+            if pub_time and int(pub_time) > 0:
+                try:
+                    pub_time_str = datetime.fromtimestamp(int(pub_time)).strftime("%Y-%m-%d %H:%M")
+                except:
+                    pub_time_str = str(pub_time)
 
             results.append({
                 "aweme_id": aweme_id,
                 "title": title,
-                "play_count": play,
+                "total_interact": m["total_interact"],
                 "nickname": nickname,
                 "user_id": user_id,
-                "liked_count": liked,
-                "collected_count": collected,
-                "comment_count": comment,
-                "share_count": share,
+                "liked_count": m["liked"],
+                "collected_count": m["collected"],
+                "comment_count": m["comment"],
+                "share_count": m["share"],
                 "tags": tags_str or "",
-                "collect_rate": round(collect_rate, 4),
-                "engagement_score": round(engagement, 4),
-                "comment_rate": round(comment_rate, 4),
+                "collect_rate": round(m["collect_rate"], 4),
+                "share_rate": round(m["share_rate"], 4),
+                "comment_rate": round(m["comment_rate"], 4),
+                "interact_rate": round(m["interact_rate"], 4),
                 "collect_score": round(collect_score, 4),
-                "engage_score": round(engage_score, 4),
+                "share_score": round(share_score, 4),
                 "comment_score": round(comment_score, 4),
+                "interact_score": round(interact_score, 4),
                 "value_score": round(value_score, 4),
-                "note_age_hours": note_age_hours or 0,
-                "pub_time": pub_time,
+                "note_age_hours": float(note_age_hours or 0),
+                "pub_time": pub_time_str,
                 "video_url": video_url or "",
             })
 
@@ -569,10 +613,10 @@ class Database:
         with open(csv_file, "w", encoding="utf-8-sig", newline="") as f:
             writer = csv.writer(f)
             writer.writerow([
-                "排名", "aweme_id", "视频链接", "标题", "播放量", "作者", "作者UID",
-                "播放速率(次/小时)", "视频年龄(小时)", "互动密度", "评论数", "标签",
-                "速率得分", "互动得分", "新鲜度得分", "播放量得分",
-                "历史增长%", "数据点数量", "发布时间", "综合评分"
+                "排名", "aweme_id", "视频链接", "标题", "互动总数", "作者", "作者UID",
+                "互动速率(次/小时)", "视频年龄(小时)", "评论数", "点赞数", "分享数", "收藏数", "标签",
+                "速率得分", "密度得分", "新鲜度得分", "评论活跃度得分",
+                "发布时间", "动量综合评分"
             ])
             for i, item in enumerate(results, 1):
                 writer.writerow([
@@ -580,20 +624,20 @@ class Database:
                     item["aweme_id"],
                     item.get("video_url", ""),
                     item["title"],
-                    item.get("current_value", 0),
+                    item.get("total_interact", 0),
                     item.get("nickname", ""),
                     item.get("user_id", ""),
                     item.get("interact_velocity", 0),
                     item.get("note_age_hours", 0),
-                    item.get("engagement_score", 0),
                     item.get("comment_count", 0),
+                    item.get("liked_count", 0),
+                    item.get("share_count", 0),
+                    item.get("collected_count", 0),
                     item.get("tags", ""),
                     item.get("velocity_score", 0),
-                    item.get("engagement_norm_score", 0),
-                    item.get("freshness_normalized", 0),
-                    item.get("normalized_value", 0),
-                    item.get("historical_growth_pct", ""),
-                    item.get("data_points", 1),
+                    item.get("density_score", 0),
+                    item.get("freshness_score", 0),
+                    item.get("comment_activity_score", 0),
                     item.get("pub_time", ""),
                     item.get("composite_score", 0),
                 ])
@@ -604,10 +648,10 @@ class Database:
         with open(csv_file, "w", encoding="utf-8-sig", newline="") as f:
             writer = csv.writer(f)
             writer.writerow([
-                "排名", "aweme_id", "视频链接", "标题", "播放量", "作者", "作者UID",
+                "排名", "aweme_id", "视频链接", "标题", "互动总数", "作者", "作者UID",
                 "点赞数", "收藏数", "评论数", "分享数",
-                "标签", "收藏率", "互动密度", "评论率",
-                "收藏得分", "互动得分", "评论得分",
+                "标签", "收藏率", "分享率", "评论率", "互动率",
+                "收藏得分", "分享得分", "评论得分", "互动得分",
                 "视频年龄(小时)", "发布时间", "价值综合评分"
             ])
             for i, item in enumerate(results, 1):
@@ -616,7 +660,7 @@ class Database:
                     item["aweme_id"],
                     item.get("video_url", ""),
                     item["title"],
-                    item.get("play_count", 0),
+                    item.get("total_interact", 0),
                     item.get("nickname", ""),
                     item.get("user_id", ""),
                     item.get("liked_count", 0),
@@ -625,11 +669,13 @@ class Database:
                     item.get("share_count", 0),
                     item.get("tags", ""),
                     item.get("collect_rate", 0),
-                    item.get("engagement_score", 0),
+                    item.get("share_rate", 0),
                     item.get("comment_rate", 0),
+                    item.get("interact_rate", 0),
                     item.get("collect_score", 0),
-                    item.get("engage_score", 0),
+                    item.get("share_score", 0),
                     item.get("comment_score", 0),
+                    item.get("interact_score", 0),
                     item.get("note_age_hours", 0),
                     item.get("pub_time", ""),
                     item.get("value_score", 0),

@@ -55,6 +55,11 @@ XHS_COOKIE = config("xhs_cookie.txt")
 XHS_COOKIE_ORIGIN = config("xhs_cookie_origin.txt")
 DOUYIN_COOKIE = config("douyin_cookie.txt")
 
+# 日志目录
+BILI_LOGS = logs("bili")
+XHS_LOGS = logs("xhs")
+DOUYIN_LOGS = logs("dy")
+
 # 数据库文件
 BILI_DB = data("bili_spider.db")
 XHS_DB = data("xhs_spider.db")

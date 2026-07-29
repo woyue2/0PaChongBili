@@ -1224,7 +1224,7 @@ class XhsSpider:
                 else:
                     self.log(f"[任务] 滚动后未捕获到搜索 API")
 
-        self.log(f"[任务] 全部完成，共 {len(all_notes)} 条笔记，详情成功 {detailed_count} 条")
+        self.log(f"[任务] 本次抓取：{len(all_notes)} 条笔记，详情成功 {detailed_count} 条")
         self.db.update_task_status(
             self.task_id, "completed",
             success_count=self.success_count,
@@ -1266,7 +1266,7 @@ class XhsSpider:
             self.log(f"[动量分析] 无数据，请先爬取关键词: {keyword}")
             return []
 
-        self.log(f"[动量分析] 共 {len(results)} 条笔记")
+        self.log(f"[动量分析] 范围：关键词累计库，共 {len(results)} 条笔记")
         self.log("")
         header = (
             f"{'排名':<4} {'标题':<30} {'互动量':>8} {'作者':<12} "
@@ -1301,7 +1301,7 @@ class XhsSpider:
             self.log(f"[价值分析] 无数据，请先爬取关键词（需含详情数据）: {keyword}")
             return []
 
-        self.log(f"[价值分析] 共 {len(results)} 条笔记")
+        self.log(f"[价值分析] 范围：关键词累计库，共 {len(results)} 条笔记")
         self.log("")
         header = (
             f"{'排名':<4} {'标题':<30} {'互动量':>8} {'作者':<12} "
