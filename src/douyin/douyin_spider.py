@@ -1,7 +1,7 @@
 """
 douyin_spider.py - 抖音爬虫主类
 基于 Playwright 监听 API 响应模式，浏览器自动签名，无需维护 X-Bogus 算法。
-搜索接口: /aweme/v1/web/search/item/
+搜索接口: /aweme/v1/web/general/search/single/
 搜索URL格式: https://www.douyin.com/search/{keyword}?aid={uuid}&type=general
 """
 
@@ -156,6 +156,44 @@ class DouyinSpider:
         with self._api_lock:
             self._api_responses.clear()
 
+    @staticmethod
+    def _extract_aweme_list(body):
+        """从不同版本的搜索响应中提取视频列表。"""
+        if not isinstance(body, dict):
+            return []
+
+        data = body.get("data", {})
+        if isinstance(data, list):
+            return data
+
+        if isinstance(data, dict):
+            for key in ("aweme_list", "items", "list", "aweme_detail"):
+                items = data.get(key)
+                if isinstance(items, list) and items:
+                    return items
+
+        items = body.get("aweme_list")
+        return items if isinstance(items, list) else []
+
+    @classmethod
+    def _is_search_items_response(cls, response_data):
+        url = response_data.get("url", "")
+        is_search_url = (
+            "/general/search/" in url
+            or "/search/item/" in url
+            or "/search/single/" in url
+        )
+        return is_search_url and bool(cls._extract_aweme_list(response_data.get("body")))
+
+    @staticmethod
+    def _item_aweme_id(item):
+        if not isinstance(item, dict):
+            return ""
+        aweme_info = item.get("aweme_info", item)
+        if not isinstance(aweme_info, dict):
+            return ""
+        return str(aweme_info.get("aweme_id", "") or "")
+
     def _wait_for_api(self, path_contains, timeout_s=15):
         start = time.time()
         while time.time() - start < timeout_s:
@@ -168,16 +206,11 @@ class DouyinSpider:
 
     def _find_api_with_items(self, path_keyword):
         with self._api_lock:
-            for r in self._api_responses:
+            # 从最新响应向前查，避免滚动后仍反复读取首屏响应。
+            for r in reversed(self._api_responses):
                 if path_keyword in r["url"]:
-                    body = r["body"]
-                    if isinstance(body, dict):
-                        # 支持多种数据结构
-                        data = body.get("data", {})
-                        if isinstance(data, dict) and "aweme_list" in data:
-                            return r
-                        if isinstance(data, list) and len(data) > 0:
-                            return r
+                    if self._extract_aweme_list(r["body"]):
+                        return r
         return None
 
     def _debug_api_urls(self):
@@ -382,15 +415,19 @@ class DouyinSpider:
         # 调试：查看捕获的 API
         self._debug_api_urls()
 
-        # 尝试多种 API 路径
-        resp = self._find_api_with_items("search/item")
+        # 优先匹配当前实际使用的搜索接口。
+        resp = self._find_api_with_items("general/search")
         if not resp:
-            resp = self._find_api_with_items("search")
+            resp = self._find_api_with_items("search/item")
         if not resp:
             self.log("[搜索] 尝试等待更多 API 响应...")
             self._page.wait_for_timeout(3000)
             self._debug_api_urls()
-            resp = self._find_api_with_items("item")
+            with self._api_lock:
+                resp = next(
+                    (r for r in reversed(self._api_responses) if self._is_search_items_response(r)),
+                    None,
+                )
 
         if not resp:
             self.log(f"[搜索] ✗ 未捕获到搜索 API")
@@ -401,24 +438,12 @@ class DouyinSpider:
         body = resp["body"]
         self.log(f"[搜索] 捕获到 API: {resp['url'].split('?')[0]}")
 
-        # 兼容不同响应结构
-        data = body.get("data", {})
-        aweme_list = []
-        if isinstance(data, dict):
-            aweme_list = data.get("aweme_list", []) or []
-            if not aweme_list:
-                # 尝试其他可能的字段名
-                for key in ["aweme_detail", "items", "list"]:
-                    if key in data and isinstance(data[key], list):
-                        aweme_list = data[key]
-                        self.log(f"[调试] 使用 data.{key} 字段")
-                        break
-        elif isinstance(data, list):
-            aweme_list = data
+        aweme_list = self._extract_aweme_list(body)
 
         if not aweme_list:
             self.log(f"[搜索] ✗ API 返回数据为空")
             self.log(f"[调试] API 响应结构: {list(body.keys())}")
+            data = body.get("data", {})
             self.log(f"[调试] data 类型: {type(data).__name__}, data keys: {list(data.keys()) if isinstance(data, dict) else 'N/A'}")
             # 打印 body 的部分内容
             self.log(f"[调试] body 预览: {str(body)[:500]}")
@@ -434,64 +459,172 @@ class DouyinSpider:
         
         return parsed
 
-    def _scroll_load_more(self, max_scrolls=5):
-        self._clear_api()
-        new_items = []
-        last_count = 0
+    def _scroll_load_more(self, seen_ids=None, max_scrolls=5):
+        """
+        将最后一个搜索结果滚入视口，等待并解析滚动后产生的新搜索响应。
 
-        for s in range(max_scrolls):
+        抖音当前使用 /general/search/single/，每个响应通常只是一个批次，
+        因此不能用响应列表长度判断翻页，必须按 aweme_id 与已见集合去重。
+        """
+        seen_ids = set(seen_ids or ())
+        self._clear_api()
+        new_items = {}
+
+        for attempt in range(1, max_scrolls + 1):
             try:
-                # 尝试多种滚动方式
-                # 1. 滚动 body
-                self._page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+                scroll_state = self._page.evaluate(r"""
+                    (seenIds) => {
+                        const links = Array.from(
+                            document.querySelectorAll('a[href*="/video/"], a[href*="/note/"]')
+                        ).filter((element, index, all) => {
+                            const href = element.href || '';
+                            return href && all.findIndex(item => item.href === href) === index;
+                        });
+                        const knownLinks = links.filter(element => {
+                            const href = element.href || '';
+                            return seenIds.some(id =>
+                                href.includes('/video/' + id) || href.includes('/note/' + id)
+                            );
+                        });
+                        const relevantLinks = knownLinks.length ? knownLinks : links;
+                        const last = relevantLinks.length
+                            ? relevantLinks[relevantLinks.length - 1]
+                            : null;
+
+                        const isScrollable = element => {
+                            if (!element) return false;
+                            const style = getComputedStyle(element);
+                            const overflowY = style.overflowY;
+                            return element.scrollHeight > element.clientHeight + 80
+                                && element.clientHeight > 200
+                                && (overflowY === 'auto'
+                                    || overflowY === 'scroll'
+                                    || overflowY === 'overlay');
+                        };
+
+                        let target = last ? last.parentElement : null;
+                        while (target && target !== document.body && !isScrollable(target)) {
+                            target = target.parentElement;
+                        }
+
+                        if (!target || !isScrollable(target)) {
+                            const candidates = Array.from(document.querySelectorAll('*'))
+                                .filter(isScrollable)
+                                .map(element => {
+                                    const videoLinks = element.querySelectorAll(
+                                        'a[href*="/video/"], a[href*="/note/"]'
+                                    ).length;
+                                    const rect = element.getBoundingClientRect();
+                                    return {
+                                        element,
+                                        videoLinks,
+                                        area: Math.max(rect.width, 0) * Math.max(rect.height, 0)
+                                    };
+                                })
+                                .sort((a, b) =>
+                                    (b.videoLinks - a.videoLinks) || (b.area - a.area)
+                                );
+                            target = candidates.length ? candidates[0].element : null;
+                        }
+
+                        if (!target) {
+                            target = document.scrollingElement || document.documentElement;
+                        }
+                        window.__douyinSearchScrollTarget = target;
+
+                        if (last) {
+                            last.scrollIntoView({behavior: 'auto', block: 'end'});
+                        }
+
+                        const before = target.scrollTop;
+                        const distance = Math.max(target.clientHeight * 0.85, 700);
+                        target.scrollTop = Math.min(
+                            target.scrollTop + distance,
+                            target.scrollHeight - target.clientHeight
+                        );
+                        target.dispatchEvent(new Event('scroll', {bubbles: true}));
+
+                        const rect = target.getBoundingClientRect();
+                        const identity = target.id
+                            ? '#' + target.id
+                            : target.tagName.toLowerCase() + (
+                                target.className && typeof target.className === 'string'
+                                    ? '.' + target.className.trim().split(/\s+/).slice(0, 2).join('.')
+                                    : ''
+                            );
+                        return {
+                            cards: relevantLinks.length,
+                            knownCards: knownLinks.length,
+                            container: identity.slice(0, 100),
+                            before: Math.round(before),
+                            top: Math.round(target.scrollTop),
+                            height: target.scrollHeight,
+                            viewport: target.clientHeight,
+                            mouseX: Math.max(1, Math.round(rect.left + rect.width / 2)),
+                            mouseY: Math.max(1, Math.round(rect.top + rect.height / 2))
+                        };
+                    }
+                """, list(seen_ids))
+                self._page.mouse.move(
+                    scroll_state.get("mouseX", 1),
+                    scroll_state.get("mouseY", 1),
+                )
+                self._page.mouse.wheel(0, 1200)
+            except Exception as e:
+                self.log(f"[滚动] 第{attempt}次滚动执行异常: {e}")
+                scroll_state = {}
+
+            # 网络回调是异步的；等待本轮滚动产生搜索响应。
+            deadline = time.time() + 8
+            processed_responses = 0
+            while time.time() < deadline:
+                with self._api_lock:
+                    responses = list(self._api_responses)
+
+                for response_data in responses[processed_responses:]:
+                    if not self._is_search_items_response(response_data):
+                        continue
+                    for item in self._extract_aweme_list(response_data["body"]):
+                        aweme_id = self._item_aweme_id(item)
+                        if aweme_id and aweme_id not in seen_ids:
+                            new_items[aweme_id] = item
+
+                processed_responses = len(responses)
+                if new_items:
+                    self.log(
+                        f"[滚动] 第{attempt}次捕获到 {len(new_items)} 条新视频 "
+                        f"(已知卡片={scroll_state.get('knownCards', '?')}/"
+                        f"{scroll_state.get('cards', '?')}, "
+                        f"容器={scroll_state.get('container', '?')}, "
+                        f"位置={scroll_state.get('top', '?')}/{scroll_state.get('height', '?')})"
+                    )
+                    return self._parse_search_items(list(new_items.values()))
+
                 self._page.wait_for_timeout(500)
-                
-                # 2. 尝试滚动搜索结果容器
-                scroll_containers = self._page.query_selector_all('[data-e2e="search-result-container"], .search-result-container, [class*="feed"]')
-                for container in scroll_containers:
-                    try:
-                        self._page.evaluate("(arguments[0]).scrollTop = (arguments[0]).scrollHeight", container)
-                        break
-                    except Exception:
-                        pass
-                
-                # 3. 模拟键盘 Page Down
-                self._page.keyboard.press("End")
-                self._page.wait_for_timeout(1000)
-                
-                # 点击第一个视频卡片，触发懒加载
-                video_cards = self._page.query_selector_all('[data-e2e="search-card"]')
-                if not video_cards:
-                    video_cards = self._page.query_selector_all('.search-card, [class*="video-card"]')
-                if video_cards:
-                    try:
-                        # 滚动到卡片可见
-                        video_cards[0].scroll_into_view()
-                        self._page.wait_for_timeout(500)
-                        video_cards[0].click()
-                        self._page.wait_for_timeout(2000)
-                        # 按 ESC 或点击返回按钮回到搜索结果
-                        self._page.keyboard.press("Escape")
-                        self._page.wait_for_timeout(1000)
-                    except Exception:
-                        pass
-                
-                # 再次滚动
-                self._page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
-                self._page.keyboard.press("End")
+
+            self.log(
+                f"[滚动] 第{attempt}次未捕获新搜索响应 "
+                f"(已知卡片={scroll_state.get('knownCards', '?')}/"
+                f"{scroll_state.get('cards', '?')}, "
+                f"容器={scroll_state.get('container', '?')}, "
+                f"位置={scroll_state.get('top', '?')}/{scroll_state.get('height', '?')})"
+            )
+            # 已在底部但观察器未触发时，上移后再次让末卡进入视口。
+            try:
+                self._page.evaluate("""
+                    () => {
+                        const target = window.__douyinSearchScrollTarget
+                            || document.scrollingElement
+                            || document.documentElement;
+                        target.scrollTop = Math.max(0, target.scrollTop - 500);
+                        target.dispatchEvent(new Event('scroll', {bubbles: true}));
+                    }
+                """)
+                self._page.wait_for_timeout(400)
             except Exception:
                 pass
-            self._page.wait_for_timeout(3000)
 
-            resp = self._find_api_with_items("search/item")
-            if resp and resp["body"].get("status_code") == 0:
-                data = resp["body"].get("data", {})
-                aweme_list = data.get("aweme_list", []) or []
-                if len(aweme_list) > last_count:
-                    new_items = aweme_list
-                    last_count = len(aweme_list)
-
-        return self._parse_search_items(new_items) if new_items else []
+        return []
 
     def crawl_keyword(self, keyword, pages=3, sort="general"):
         self.task_id = self.db.create_task(keyword, pages, sort)
@@ -517,16 +650,10 @@ class DouyinSpider:
             self.log(f"[任务] 等待 {delay:.1f}s 后滚动加载第{page}页...")
             time.sleep(delay)
 
-            try:
-                self._page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
-                time.sleep(2)
-                self._page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
-            except Exception:
-                pass
-
-            time.sleep(3)
-
-            new_videos = self._scroll_load_more(max_scrolls=2)
+            new_videos = self._scroll_load_more(
+                seen_ids=aweme_ids_seen,
+                max_scrolls=3,
+            )
             new_count = 0
             for v in new_videos:
                 if v["aweme_id"] not in aweme_ids_seen:
