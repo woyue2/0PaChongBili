@@ -127,12 +127,67 @@ class Database:
                 interact_velocity REAL DEFAULT 0,
                 engagement_score REAL DEFAULT 0,
                 fetched_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                share_link_status TEXT DEFAULT 'pending',
+                share_link_attempts INTEGER DEFAULT 0,
+                share_link_error TEXT,
+                share_link_fetched_at DATETIME,
                 FOREIGN KEY (task_id) REFERENCES spider_tasks(id)
             )
         """)
+        existing_note_columns = {
+            row[1] for row in cursor.execute("PRAGMA table_info(xhs_notes)").fetchall()
+        }
+        note_column_migrations = {
+            "share_link_status": "TEXT DEFAULT 'pending'",
+            "share_link_attempts": "INTEGER DEFAULT 0",
+            "share_link_error": "TEXT",
+            "share_link_fetched_at": "DATETIME",
+        }
+        for column, definition in note_column_migrations.items():
+            if column not in existing_note_columns:
+                cursor.execute(
+                    f"ALTER TABLE xhs_notes ADD COLUMN {column} {definition}"
+                )
 
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_notes_task_id ON xhs_notes(task_id)")
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_notes_note_id ON xhs_notes(note_id)")
+
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS task_notes (
+                task_id INTEGER NOT NULL,
+                note_id TEXT NOT NULL,
+                search_rank INTEGER,
+                xsec_token TEXT,
+                discovered_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY (task_id, note_id),
+                FOREIGN KEY (task_id) REFERENCES spider_tasks(id)
+            )
+        """)
+        existing_task_note_columns = {
+            row[1] for row in cursor.execute("PRAGMA table_info(task_notes)").fetchall()
+        }
+        if "xsec_token" not in existing_task_note_columns:
+            cursor.execute("ALTER TABLE task_notes ADD COLUMN xsec_token TEXT")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_task_notes_note_id ON task_notes(note_id)")
+        cursor.execute("""
+            INSERT OR IGNORE INTO task_notes (task_id, note_id, discovered_at)
+            SELECT task_id, note_id, COALESCE(fetched_at, CURRENT_TIMESTAMP)
+            FROM xhs_notes
+            WHERE task_id IS NOT NULL
+        """)
+        cursor.execute("""
+            UPDATE xhs_notes
+            SET share_link_status = CASE
+                    WHEN COALESCE(TRIM(url), '') <> '' THEN 'success'
+                    WHEN share_link_status IS NULL OR share_link_status = '' THEN 'pending'
+                    ELSE share_link_status
+                END,
+                share_link_fetched_at = CASE
+                    WHEN COALESCE(TRIM(url), '') <> ''
+                    THEN COALESCE(share_link_fetched_at, fetched_at)
+                    ELSE share_link_fetched_at
+                END
+        """)
 
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS xhs_users (
@@ -188,6 +243,158 @@ class Database:
         self.conn.commit()
         return cursor.lastrowid
 
+    def get_task(self, task_id):
+        row = self.conn.execute(
+            """
+            SELECT id, keyword, pages, order_by, status, created_at, completed_at
+            FROM spider_tasks
+            WHERE id = ?
+            """,
+            (task_id,),
+        ).fetchone()
+        if not row:
+            return None
+        keys = (
+            "id", "keyword", "pages", "order_by",
+            "status", "created_at", "completed_at",
+        )
+        return dict(zip(keys, row))
+
+    def link_task_note(
+        self, task_id, note_id, search_rank=None, xsec_token="", title=""
+    ):
+        if not task_id or not note_id:
+            return
+        now = datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
+        self.conn.execute(
+            """
+            INSERT OR IGNORE INTO xhs_notes (
+                task_id, note_id, title, xsec_token, fetched_at,
+                share_link_status, share_link_attempts
+            ) VALUES (?, ?, ?, ?, ?, 'pending', 0)
+            """,
+            (task_id, note_id, title, xsec_token, now),
+        )
+        self.conn.execute(
+            """
+            INSERT INTO task_notes (
+                task_id, note_id, search_rank, xsec_token, discovered_at
+            )
+            VALUES (?, ?, ?, ?, ?)
+            ON CONFLICT(task_id, note_id) DO UPDATE SET
+                search_rank = COALESCE(excluded.search_rank, task_notes.search_rank),
+                xsec_token = COALESCE(NULLIF(excluded.xsec_token, ''), task_notes.xsec_token)
+            """,
+            (
+                task_id,
+                note_id,
+                search_rank,
+                xsec_token,
+                now,
+            ),
+        )
+        self.conn.commit()
+
+    def get_existing_share_link(self, note_id):
+        row = self.conn.execute(
+            """
+            SELECT url
+            FROM xhs_notes
+            WHERE note_id = ?
+              AND share_link_status = 'success'
+              AND COALESCE(TRIM(url), '') <> ''
+            """,
+            (note_id,),
+        ).fetchone()
+        return (row[0] or "") if row else ""
+
+    def record_share_link_result(self, note_id, share_link="", error=""):
+        if not note_id:
+            return
+        now = datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
+        if share_link:
+            self.conn.execute(
+                """
+                UPDATE xhs_notes
+                SET url = ?,
+                    share_link_status = 'success',
+                    share_link_attempts = COALESCE(share_link_attempts, 0) + 1,
+                    share_link_error = NULL,
+                    share_link_fetched_at = ?,
+                    fetched_at = ?
+                WHERE note_id = ?
+                """,
+                (share_link, now, now, note_id),
+            )
+        else:
+            self.conn.execute(
+                """
+                UPDATE xhs_notes
+                SET share_link_status = CASE
+                        WHEN COALESCE(TRIM(url), '') <> '' THEN 'success'
+                        ELSE 'failed'
+                    END,
+                    share_link_attempts = COALESCE(share_link_attempts, 0) + 1,
+                    share_link_error = CASE
+                        WHEN COALESCE(TRIM(url), '') <> '' THEN share_link_error
+                        ELSE ?
+                    END,
+                    fetched_at = ?
+                WHERE note_id = ?
+                """,
+                (error or "复制链接失败", now, note_id),
+            )
+        self.conn.commit()
+
+    def get_pending_share_links(self, task_id, limit=None):
+        sql = """
+            SELECT tn.note_id, COALESCE(NULLIF(tn.xsec_token, ''), n.xsec_token),
+                   n.title, n.url,
+                   n.share_link_status, COALESCE(n.share_link_attempts, 0)
+            FROM task_notes tn
+            LEFT JOIN xhs_notes n ON n.note_id = tn.note_id
+            WHERE tn.task_id = ?
+              AND (
+                    n.note_id IS NULL
+                    OR n.share_link_status <> 'success'
+                    OR COALESCE(TRIM(n.url), '') = ''
+                  )
+            ORDER BY COALESCE(tn.search_rank, 2147483647), tn.discovered_at
+        """
+        params = [task_id]
+        if limit is not None:
+            sql += " LIMIT ?"
+            params.append(limit)
+        rows = self.conn.execute(sql, params).fetchall()
+        keys = (
+            "note_id", "xsec_token", "title", "url",
+            "share_link_status", "share_link_attempts",
+        )
+        return [dict(zip(keys, row)) for row in rows]
+
+    def get_link_completion(self, task_id):
+        row = self.conn.execute(
+            """
+            SELECT COUNT(*) AS total,
+                   SUM(CASE
+                       WHEN n.share_link_status = 'success'
+                        AND COALESCE(TRIM(n.url), '') <> ''
+                       THEN 1 ELSE 0
+                   END) AS completed
+            FROM task_notes tn
+            LEFT JOIN xhs_notes n ON n.note_id = tn.note_id
+            WHERE tn.task_id = ?
+            """,
+            (task_id,),
+        ).fetchone()
+        total = int((row and row[0]) or 0)
+        completed = int((row and row[1]) or 0)
+        return {
+            "total": total,
+            "completed": completed,
+            "missing": max(total - completed, 0),
+        }
+
     def update_task_status(self, task_id, status, **kwargs):
         cursor = self.conn.cursor()
         fields = []
@@ -211,8 +418,22 @@ class Database:
         if not note_id:
             return None
 
-        cursor.execute("SELECT id FROM xhs_notes WHERE note_id = ?", (note_id,))
+        cursor.execute(
+            "SELECT id, url, share_link_status FROM xhs_notes WHERE note_id = ?",
+            (note_id,),
+        )
         row = cursor.fetchone()
+        incoming_url = (note_data.get("url") or "").strip()
+        existing_url = ((row[1] if row else "") or "").strip()
+        effective_url = incoming_url or existing_url
+        if effective_url:
+            link_status = "success"
+            link_error = None
+            link_fetched_at = now if incoming_url else note_data.get("share_link_fetched_at")
+        else:
+            link_status = note_data.get("share_link_status") or "failed"
+            link_error = note_data.get("share_link_error") or "复制链接失败"
+            link_fetched_at = note_data.get("share_link_fetched_at")
 
         if row:
             cursor.execute("""
@@ -237,12 +458,16 @@ class Database:
                     note_age_hours = ?,
                     interact_velocity = ?,
                     engagement_score = ?,
-                    fetched_at = ?
+                    fetched_at = ?,
+                    share_link_status = ?,
+                    share_link_attempts = COALESCE(share_link_attempts, 0) + ?,
+                    share_link_error = ?,
+                    share_link_fetched_at = COALESCE(?, share_link_fetched_at)
                 WHERE note_id = ?
             """, (
                 task_id,
                 note_data.get("title"),
-                note_data.get("url"),
+                effective_url,
                 note_data.get("xsec_token"),
                 note_data.get("interact_count", 0),
                 note_data.get("liked_count", 0),
@@ -261,6 +486,10 @@ class Database:
                 note_data.get("interact_velocity", 0),
                 note_data.get("engagement_score", 0),
                 now,
+                link_status,
+                1 if note_data.get("share_link_attempted") else 0,
+                link_error,
+                link_fetched_at,
                 note_id,
             ))
             note_db_id = row[0]
@@ -271,12 +500,13 @@ class Database:
                     interact_count, liked_count, collected_count, comment_count, share_count,
                     nickname, user_id, fans_count, pub_time, note_type,
                     description, tags, category, note_age_hours, interact_velocity,
-                    engagement_score, fetched_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    engagement_score, fetched_at, share_link_status,
+                    share_link_attempts, share_link_error, share_link_fetched_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (
                 task_id, note_id,
                 note_data.get("title"),
-                note_data.get("url"),
+                effective_url,
                 note_data.get("xsec_token"),
                 note_data.get("interact_count", 0),
                 note_data.get("liked_count", 0),
@@ -295,8 +525,21 @@ class Database:
                 note_data.get("interact_velocity", 0),
                 note_data.get("engagement_score", 0),
                 now,
+                link_status,
+                1 if note_data.get("share_link_attempted") else 0,
+                link_error,
+                link_fetched_at,
             ))
             note_db_id = cursor.lastrowid
+
+        cursor.execute(
+            """
+            INSERT INTO task_notes (task_id, note_id, search_rank, discovered_at)
+            VALUES (?, ?, ?, ?)
+            ON CONFLICT(task_id, note_id) DO NOTHING
+            """,
+            (task_id, note_id, note_data.get("search_rank"), now),
+        )
 
         cursor.execute("""
             INSERT INTO note_history (
@@ -371,8 +614,12 @@ class Database:
                    n.interact_velocity, n.note_age_hours, n.engagement_score,
                    n.comment_count, n.liked_count, n.collected_count, n.share_count, n.tags, n.url
             FROM xhs_notes n
-            JOIN spider_tasks t ON n.task_id = t.id
-            WHERE t.keyword = ?
+            WHERE n.note_id IN (
+                SELECT tn.note_id
+                FROM task_notes tn
+                JOIN spider_tasks t ON t.id = tn.task_id
+                WHERE t.keyword = ?
+            )
             ORDER BY n.interact_count DESC
         """, (keyword,))
         notes = cursor.fetchall()
@@ -494,8 +741,12 @@ class Database:
                    n.note_age_hours, n.engagement_score, n.comment_count,
                    n.liked_count, n.collected_count, n.share_count, n.tags, n.url
             FROM xhs_notes n
-            JOIN spider_tasks t ON n.task_id = t.id
-            WHERE t.keyword = ?
+            WHERE n.note_id IN (
+                SELECT tn.note_id
+                FROM task_notes tn
+                JOIN spider_tasks t ON t.id = tn.task_id
+                WHERE t.keyword = ?
+            )
               AND n.liked_count > 0
             ORDER BY n.interact_count DESC
         """, (keyword,))

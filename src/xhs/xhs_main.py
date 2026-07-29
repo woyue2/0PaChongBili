@@ -9,9 +9,12 @@ xhs_main.py - 小红书爬虫命令行入口
     python xhs_main.py -m momentum -k 美食 --csv output.csv
     python xhs_main.py -m value -k 美食 --csv output.csv
 
-  登录:
-    python xhs_main.py login
+  登录态检测:
     python xhs_main.py check-login
+    # search 每次启动都会自动验证；超过3天或会话失效时强制扫码刷新
+
+  补抓缺失分享链接:
+    python xhs_main.py retry-links --task-id 123 --headed
 
 输出目录:
   ./output/{关键词}/
@@ -52,7 +55,10 @@ def main():
     search_p.add_argument("--headed", action="store_true", help="有头模式（显示浏览器，默认无头）")
 
     sub.add_parser("check-login", help="检测登录态是否有效")
-    sub.add_parser("login", help="打开浏览器手动登录并保存 cookie")
+    retry_p = sub.add_parser("retry-links", help="只补指定任务中缺失的分享链接")
+    retry_p.add_argument("--task-id", type=int, required=True, help="原抓取任务 ID")
+    retry_p.add_argument("--limit", type=int, help="本次最多补多少条")
+    retry_p.add_argument("--headed", action="store_true", help="有头模式（显示浏览器）")
 
     args = parser.parse_args()
 
@@ -69,67 +75,10 @@ def main():
             if ok:
                 print("\n登录态有效 ✓")
             else:
-                print("\n登录态失效 ✗，请运行: python xhs_main.py login")
+                print("\n登录态失效 ✗；运行 search 时会自动打开浏览器要求扫码刷新")
                 sys.exit(1)
         finally:
             spider.close()
-
-    elif args.command == "login":
-        import time
-        from playwright.sync_api import sync_playwright
-
-        print("=" * 60)
-        print("  小红书扫码登录")
-        print("=" * 60)
-        print()
-        print("  浏览器将打开，请手动扫码登录")
-        print("  登录成功后，cookie 会自动保存到 xhs_cookie.txt")
-        print("  登录完成后，按 Enter 继续...")
-        print()
-
-        from src.common import paths
-        cookie_file = paths.XHS_COOKIE
-        existing_cookies = ""
-        if os.path.exists(cookie_file):
-            with open(cookie_file, "r", encoding="utf-8") as f:
-                existing_cookies = f.read().strip()
-
-        with sync_playwright() as p:
-            browser = p.chromium.launch(channel="msedge", headless=False)
-            context = browser.new_context(
-                viewport={"width": 1280, "height": 800},
-            )
-
-            if existing_cookies:
-                cks = []
-                for part in existing_cookies.split(";"):
-                    part = part.strip()
-                    if "=" in part:
-                        k, v = part.split("=", 1)
-                        cks.append({
-                            "name": k.strip(),
-                            "value": v.strip(),
-                            "domain": ".xiaohongshu.com",
-                            "path": "/",
-                        })
-                if cks:
-                    context.add_cookies(cks)
-                    print(f"  已加载已有 cookie ({len(cks)} 个字段)")
-
-            page = context.new_page()
-            page.goto("https://www.xiaohongshu.com/", wait_until="domcontentloaded")
-            print()
-            input("  登录完成后按 Enter 继续...")
-
-            cookies = context.cookies("https://www.xiaohongshu.com")
-            cookie_str = "; ".join(f"{c['name']}={c['value']}" for c in cookies)
-
-            with open(cookie_file, "w", encoding="utf-8") as f:
-                f.write(cookie_str)
-
-            print(f"\n  ✓ Cookie 已保存到 {cookie_file}")
-            print(f"  共 {len(cookies)} 个字段")
-            browser.close()
 
     elif args.command == "search":
         args.headless = not args.headed
@@ -137,6 +86,9 @@ def main():
         output_dir = paths.output(args.keyword)
         spider = XhsSpider(args, output_dir=output_dir, mode=args.mode)
         try:
+            if not spider.ensure_login_ready():
+                print("[错误] 登录刷新失败，已停止本次抓取")
+                sys.exit(1)
             spider.crawl_keyword(
                 keyword=args.keyword,
                 pages=args.pages,
@@ -146,6 +98,17 @@ def main():
             print(f"[错误] 爬取过程中发生异常: {e}")
             import traceback
             traceback.print_exc()
+        finally:
+            spider.close()
+
+    elif args.command == "retry-links":
+        args.headless = not args.headed
+        spider = XhsSpider(args)
+        try:
+            if not spider.ensure_login_ready():
+                print("[错误] 登录刷新失败，已停止补链接")
+                sys.exit(1)
+            spider.retry_missing_links(args.task_id, limit=args.limit)
         finally:
             spider.close()
 

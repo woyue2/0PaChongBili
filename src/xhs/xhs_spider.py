@@ -10,8 +10,9 @@ import threading
 from datetime import datetime
 from urllib.parse import quote
 
-from xhs_util import DB_FILE, COOKIE_FILE, CookieManager, Database
+from xhs_util import DB_FILE, COOKIE_FILE, Database
 from src.common import paths
+from src.common.auth_state import AuthStateStore, LOGIN_MAX_AGE_DAYS
 
 
 def _parse_chinese_num(s):
@@ -38,8 +39,8 @@ def _parse_chinese_num(s):
 class XhsSpider:
     def __init__(self, args, output_dir=None, mode="both"):
         self.args = args
-        self.cookie_mgr = CookieManager(COOKIE_FILE)
         self.db = Database(DB_FILE)
+        self.auth_state = AuthStateStore()
         self.task_id = None
         self.output_dir = output_dir
         self.mode = mode
@@ -53,6 +54,7 @@ class XhsSpider:
         self._pw_lock = threading.Lock()
         self._api_responses = []
         self._api_lock = threading.Lock()
+        self._api_sequence = 0
         self._init_logger()
 
     def _init_logger(self):
@@ -77,54 +79,33 @@ class XhsSpider:
 
     def _ensure_playwright(self):
         with self._pw_lock:
-            if self._browser is not None:
+            if self._context is not None:
                 return
             from playwright.sync_api import sync_playwright
             self._pw = sync_playwright().start()
 
             headless = getattr(self.args, "headless", True)
-
-            self._browser = self._pw.chromium.launch(
+            os.makedirs(os.path.dirname(paths.XHS_EDGE_PROFILE), exist_ok=True)
+            self._context = self._pw.chromium.launch_persistent_context(
+                user_data_dir=paths.XHS_EDGE_PROFILE,
                 channel="msedge",
                 headless=headless,
+                viewport={"width": 1920, "height": 1080},
+                permissions=["clipboard-read", "clipboard-write"],
                 args=[
                     "--disable-blink-features=AutomationControlled",
                     "--no-sandbox",
                     "--disable-dev-shm-usage",
                 ],
             )
-
-            cookie_str = self.cookie_mgr.get_cookie()
-            cookies_for_pw = []
-            if cookie_str:
-                for part in cookie_str.split(";"):
-                    part = part.strip()
-                    if "=" in part:
-                        k, v = part.split("=", 1)
-                        cookies_for_pw.append({
-                            "name": k.strip(),
-                            "value": v.strip(),
-                            "domain": ".xiaohongshu.com",
-                            "path": "/",
-                        })
-
-            self._context = self._browser.new_context(
-                viewport={"width": 1920, "height": 1080},
-                user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36 Edg/120.0.0.0",
-                permissions=["clipboard-read", "clipboard-write"],
-            )
-
-            if cookies_for_pw:
-                self._context.add_cookies(cookies_for_pw)
-                self.log(f"[浏览器] 已注入 {len(cookies_for_pw)} 个 cookie")
-
-            self._page = self._context.new_page()
+            self._browser = self._context.browser
+            self._page = self._context.pages[0] if self._context.pages else self._context.new_page()
             self._page.on("response", self._on_response)
 
             # Hook navigator.clipboard.writeText / readText：把写入的完整分享链接存到全局变量
             # 小红书点「复制链接」后会调 clipboard.writeText(完整URL)，直接读 hook 就能拿到，
             # 不再受 headless 剪贴板权限/系统隔离影响
-            self._page.add_init_script("""() => {
+            self._context.add_init_script("""() => {
                 try {
                     window.__xhs_last_share_link__ = '';
                     window.__xhs_share_link_log__ = [];
@@ -171,7 +152,10 @@ class XhsSpider:
                 } catch(_) {}
             }""")
 
-            self.log(f"[浏览器] Edge 浏览器已启动 (headless={headless})")
+            self.log(
+                f"[浏览器] Edge 持久化 profile 已启动 "
+                f"(headless={headless}, profile={paths.XHS_EDGE_PROFILE})"
+            )
 
     def _on_response(self, response):
         url = response.url
@@ -180,7 +164,9 @@ class XhsSpider:
         try:
             body = response.json()
             with self._api_lock:
+                self._api_sequence += 1
                 self._api_responses.append({
+                    "seq": self._api_sequence,
                     "url": url,
                     "status": response.status,
                     "body": body,
@@ -202,9 +188,31 @@ class XhsSpider:
             time.sleep(0.5)
         return None
 
-    def _find_api_with_items(self, path_keyword):
+    def _api_cursor(self):
         with self._api_lock:
-            for r in self._api_responses:
+            return self._api_sequence
+
+    def _wait_for_api_with_items(self, path_keyword, after_seq=0, timeout_s=15):
+        deadline = time.time() + timeout_s
+        while time.time() < deadline:
+            with self._api_lock:
+                for response in reversed(self._api_responses):
+                    if response.get("seq", 0) <= after_seq:
+                        break
+                    if path_keyword not in response["url"]:
+                        continue
+                    body = response.get("body") or {}
+                    data = body.get("data", {}) if isinstance(body, dict) else {}
+                    if isinstance(data, dict) and isinstance(data.get("items"), list):
+                        return response
+            self._page.wait_for_timeout(300)
+        return None
+
+    def _find_api_with_items(self, path_keyword, after_seq=0):
+        with self._api_lock:
+            for r in reversed(self._api_responses):
+                if r.get("seq", 0) <= after_seq:
+                    break
                 if path_keyword in r["url"]:
                     body = r["body"]
                     if isinstance(body, dict):
@@ -213,13 +221,31 @@ class XhsSpider:
                             return r
         return None
 
+    def _wheel_scroll(self, steps=3, minimum=450, maximum=850):
+        """用滚轮分段滚动，避免 JavaScript 瞬移。"""
+        for _ in range(steps):
+            self._page.mouse.wheel(0, random.randint(minimum, maximum))
+            self._page.wait_for_timeout(random.randint(450, 950))
+
+    def _scroll_until_new_search_response(self, timeout_s=12):
+        cursor = self._api_cursor()
+        deadline = time.time() + timeout_s
+        while time.time() < deadline:
+            self._wheel_scroll(steps=random.randint(2, 4))
+            response = self._wait_for_api_with_items(
+                "search/notes",
+                after_seq=cursor,
+                timeout_s=2,
+            )
+            if response:
+                return response
+        return None
+
     def _close_playwright(self):
         with self._pw_lock:
             try:
                 if self._context:
                     self._context.close()
-                if self._browser:
-                    self._browser.close()
                 if self._pw:
                     self._pw.stop()
             except Exception:
@@ -248,6 +274,120 @@ class XhsSpider:
             msg = resp["body"].get("msg", "?") if resp else "无响应"
             self.log(f"[登录检测] ✗ 登录失效: code={code}, msg={msg}")
             return False
+
+    def _latest_logged_in_user(self):
+        with self._api_lock:
+            responses = list(reversed(self._api_responses))
+        for resp in responses:
+            if "/user/me" not in resp["url"]:
+                continue
+            body = resp.get("body") or {}
+            if body.get("code") == 0:
+                data = body.get("data") or {}
+                return data.get("nickname") or "已登录用户"
+        return ""
+
+    def _save_current_cookies(self):
+        """导出 Cookie 仅作兼容备份；运行时不再向新 context 注入。"""
+        cookies = self._context.cookies("https://www.xiaohongshu.com")
+        cookie_str = "; ".join(
+            f"{cookie['name']}={cookie['value']}" for cookie in cookies
+        )
+        os.makedirs(os.path.dirname(COOKIE_FILE), exist_ok=True)
+        with open(COOKIE_FILE, "w", encoding="utf-8") as cookie_file:
+            cookie_file.write(cookie_str)
+        self.log(f"[登录刷新] 已保存 {len(cookies)} 个 Cookie")
+
+    def _clear_site_login_state(self):
+        """清除当前平台 profile 中的站点登录状态，保留 profile 本身。"""
+        self._context.clear_cookies()
+        try:
+            self._page.goto(
+                "https://www.xiaohongshu.com/",
+                wait_until="domcontentloaded",
+                timeout=30000,
+            )
+            self._page.evaluate("""async () => {
+                try { localStorage.clear(); } catch (_) {}
+                try { sessionStorage.clear(); } catch (_) {}
+                try {
+                    if (window.indexedDB && indexedDB.databases) {
+                        const dbs = await indexedDB.databases();
+                        await Promise.all((dbs || []).map(db => new Promise(resolve => {
+                            if (!db.name) return resolve();
+                            const req = indexedDB.deleteDatabase(db.name);
+                            req.onsuccess = req.onerror = req.onblocked = () => resolve();
+                        })));
+                    }
+                } catch (_) {}
+                try {
+                    if (window.caches) {
+                        const keys = await caches.keys();
+                        await Promise.all(keys.map(key => caches.delete(key)));
+                    }
+                } catch (_) {}
+                try {
+                    if (navigator.serviceWorker) {
+                        const regs = await navigator.serviceWorker.getRegistrations();
+                        await Promise.all(regs.map(reg => reg.unregister()));
+                    }
+                } catch (_) {}
+            }""")
+        except Exception as exc:
+            self.log(f"[登录刷新] 清理站点存储时出现非致命异常: {exc}")
+
+    def _force_interactive_login(self, timeout_s=180):
+        self.log("[登录刷新] 登录记录已超过3天或当前会话无效，强制刷新")
+        self._close_playwright()
+        self.args.headless = False
+        self._ensure_playwright()
+        self._clear_site_login_state()
+        self._clear_api()
+
+        self._page.goto(
+            "https://www.xiaohongshu.com/",
+            wait_until="domcontentloaded",
+            timeout=30000,
+        )
+        self._page.wait_for_timeout(2000)
+        try:
+            login_button = self._page.get_by_text("登录", exact=True).first
+            if login_button.is_visible():
+                login_button.click()
+        except Exception:
+            pass
+
+        self.log(f"[登录刷新] 请在浏览器中扫码登录，最多等待 {timeout_s} 秒...")
+        deadline = time.time() + timeout_s
+        while time.time() < deadline:
+            nickname = self._latest_logged_in_user()
+            if nickname:
+                self._save_current_cookies()
+                self.auth_state.mark_login("xhs")
+                self.log(f"[登录刷新] ✓ 登录成功: {nickname}")
+                return True
+            self._page.wait_for_timeout(1000)
+
+        self.log("[登录刷新] ✗ 等待扫码登录超时")
+        return False
+
+    def ensure_login_ready(self, max_age_days=LOGIN_MAX_AGE_DAYS):
+        """每次抓取前执行：3天内验证会话，超期或失效则强制扫码刷新。"""
+        state = self.auth_state.get("xhs")
+        if not self.auth_state.is_login_due("xhs", max_age_days=max_age_days):
+            last_login = state.get("last_login_at") if state else "?"
+            self.log(f"[登录门禁] 最近登录时间 {last_login}，未超过{max_age_days}天，验证现有会话")
+            if self.check_login():
+                self.auth_state.mark_verified("xhs")
+                self.log("[登录门禁] ✓ 持久化会话有效，无需重复扫码或注入 Cookie")
+                return True
+            self.log("[登录门禁] 会话验证失败，转为强制刷新")
+        else:
+            last_login = state.get("last_login_at") if state else None
+            reason = f"上次登录时间 {last_login}" if last_login else "没有登录时间记录"
+            self.log(f"[登录门禁] {reason}，需要强制刷新")
+
+        return self._force_interactive_login()
 
     def _parse_search_items(self, items):
         results = []
@@ -288,33 +428,90 @@ class XhsSpider:
     def search_notes(self, keyword, page=1, sort="general"):
         self._ensure_playwright()
         self._clear_api()
-
-        sort_map = {
-            "general": "",
-            "popular": "popularity_descending",
-            "new": "time_descending",
-        }
-        sort_val = sort_map.get(sort, "")
-
-        search_url = f"https://www.xiaohongshu.com/search_result?keyword={quote(keyword)}"
-        if sort_val:
-            search_url += f"&sort={sort_val}"
-
         self.log(f"[搜索] 关键词='{keyword}' 第{page}页 排序={sort}")
-        self._page.goto(search_url, wait_until="domcontentloaded", timeout=30000)
-        self._page.wait_for_timeout(5000)
+        self._page.goto(
+            "https://www.xiaohongshu.com/",
+            wait_until="domcontentloaded",
+            timeout=30000,
+        )
+        self._page.wait_for_timeout(1800)
 
-        for i in range(2):
-            try:
-                self._page.evaluate(f"window.scrollTo(0, {500 + i * 400})")
-            except Exception:
-                pass
-            self._page.wait_for_timeout(1500)
+        search_input = None
+        for selector in (
+            "input[placeholder*='搜索']",
+            "input[type='search']",
+            ".search-input input",
+            "input[type='text']",
+        ):
+            candidate = self._page.query_selector(selector)
+            if candidate and candidate.is_visible():
+                search_input = candidate
+                break
 
-        resp = self._find_api_with_items("search/notes")
+        if not search_input:
+            self.log("[搜索] ✗ 首页未找到可见搜索框")
+            return []
+
+        search_input.click()
+        search_input.press("Control+A")
+        search_input.type(keyword, delay=random.randint(80, 160))
+        cursor = self._api_cursor()
+
+        submitted = False
+        for selector in (
+            "button:has-text('搜索')",
+            ".search-icon",
+            "[class*='search-icon']",
+            "[data-testid='search-button']",
+        ):
+            button = self._page.query_selector(selector)
+            if button and button.is_visible():
+                try:
+                    button.click()
+                    submitted = True
+                    break
+                except Exception:
+                    pass
+        if not submitted:
+            search_input.press("Enter")
+
+        resp = self._wait_for_api_with_items(
+            "search/notes",
+            after_seq=cursor,
+            timeout_s=15,
+        )
         if not resp:
             self.log(f"[搜索] ✗ 未捕获到搜索 API")
             return []
+
+        if sort != "general":
+            sort_labels = {
+                "popular": ("最热", "最多点赞", "热度"),
+                "new": ("最新", "最新发布", "时间"),
+            }.get(sort, ())
+            sort_cursor = self._api_cursor()
+            sort_clicked = False
+            for label in sort_labels:
+                try:
+                    option = self._page.get_by_text(label, exact=True).first
+                    if option.is_visible():
+                        option.click()
+                        sort_clicked = True
+                        break
+                except Exception:
+                    pass
+            if sort_clicked:
+                sorted_resp = self._wait_for_api_with_items(
+                    "search/notes",
+                    after_seq=sort_cursor,
+                    timeout_s=10,
+                )
+                if sorted_resp:
+                    resp = sorted_resp
+                else:
+                    self.log(f"[搜索] 排序={sort} 已点击，但未捕获新响应，使用当前结果")
+            else:
+                self.log(f"[搜索] 未找到排序={sort} 的可见选项，使用综合排序")
 
         body = resp["body"]
         if body.get("code") != 0:
@@ -327,23 +524,15 @@ class XhsSpider:
         return self._parse_search_items(items)
 
     def _scroll_load_more(self, max_scrolls=5):
-        self._clear_api()
         new_items = []
-        last_count = 0
 
-        for s in range(max_scrolls):
-            try:
-                self._page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
-            except Exception:
-                pass
-            self._page.wait_for_timeout(2500)
-
-            resp = self._find_api_with_items("search/notes")
+        for _ in range(max_scrolls):
+            resp = self._scroll_until_new_search_response(timeout_s=10)
             if resp and resp["body"].get("code") == 0:
                 items = resp["body"].get("data", {}).get("items", []) or []
-                if len(items) > last_count:
-                    new_items = items
-                    last_count = len(items)
+                if items:
+                    new_items.extend(items)
+                    break
 
         return self._parse_search_items(new_items) if new_items else []
 
@@ -361,6 +550,23 @@ class XhsSpider:
             if cards:
                 return cards
         return []
+
+    def _find_card_for_note(self, cards, note_id, fallback_index):
+        """优先按 note_id 定位卡片，避免虚拟列表变化造成索引错位。"""
+        if note_id:
+            for card in cards:
+                try:
+                    href = card.get_attribute("href") or ""
+                    if note_id in href:
+                        return card
+                    link = card.query_selector(f"a[href*='{note_id}']")
+                    if link:
+                        return card
+                except Exception:
+                    continue
+        if 0 <= fallback_index < len(cards):
+            return cards[fallback_index]
+        return None
 
     def _extract_pubtime_tags_from_dom(self):
         try:
@@ -626,7 +832,9 @@ class XhsSpider:
             # 1. 点击分享按钮
             share_btn = self._page.query_selector(
                 ".note-detail-mask .buttons[data-v-2820500a] .share-icon, "
-                ".note-detail-mask .share-icon-container"
+                ".note-detail-mask .share-icon-container, "
+                ".note-detail-mask [class*='share-icon'], "
+                ".buttons .share-icon, .share-icon-container, [class*='share-icon']"
             )
             if not share_btn:
                 self.log("[分享链接] 未找到分享按钮")
@@ -639,8 +847,12 @@ class XhsSpider:
             popup1 = None
             popup2 = None
             for _ in range(6):
-                popup1 = self._page.query_selector(".share-wrapper[data-v-fe59674e]")
-                popup2 = self._page.query_selector(".xhs-note-share-popup[data-v-0d218a15]")
+                popup1 = self._page.query_selector(
+                    ".share-wrapper[data-v-fe59674e], .share-wrapper"
+                )
+                popup2 = self._page.query_selector(
+                    ".xhs-note-share-popup[data-v-0d218a15], .xhs-note-share-popup"
+                )
                 p1_ok = bool(popup1 and popup1.is_visible())
                 p2_ok = bool(popup2 and popup2.is_visible())
                 if p1_ok or p2_ok:
@@ -729,10 +941,14 @@ class XhsSpider:
             if popup2_found:
                 copy_el = None
                 try:
-                    action_items = popup2.query_selector_all(".xhs-note-share-popup-action-item")
+                    action_items = popup2.query_selector_all(
+                        ".xhs-note-share-popup-action-item, [class*='share-popup-action-item']"
+                    )
                     for it in action_items:
                         try:
-                            label = it.query_selector(".xhs-note-share-popup-action-label")
+                            label = it.query_selector(
+                                ".xhs-note-share-popup-action-label, [class*='share-popup-action-label']"
+                            )
                             txt = (label.inner_text() if label else "") or ""
                             if "复制链接" in txt:
                                 copy_el = it
@@ -742,7 +958,9 @@ class XhsSpider:
                 except Exception:
                     pass
                 if not copy_el:
-                    label_list = popup2.query_selector_all(".xhs-note-share-popup-action-label")
+                    label_list = popup2.query_selector_all(
+                        ".xhs-note-share-popup-action-label, [class*='share-popup-action-label']"
+                    )
                     for lab in label_list:
                         try:
                             txt = (lab.inner_text() or "")
@@ -765,7 +983,7 @@ class XhsSpider:
             # 5. popup1 兼容
             if not clicked_ok and popup1_found:
                 try:
-                    items = popup1.query_selector_all(".item[data-v-fe59674e]")
+                    items = popup1.query_selector_all(".item[data-v-fe59674e], .item")
                     for it in items:
                         try:
                             tip = it.get_attribute("data-tooltip") or ""
@@ -931,26 +1149,30 @@ class XhsSpider:
             pass
 
     def _get_detail_by_card_index(self, card_index, search_note_data=None):
+        search_note_id = (
+            (search_note_data.get("note_id", "") if search_note_data else "") or ""
+        )
         cards = self._get_all_cards()
-        if card_index >= len(cards):
+        card = self._find_card_for_note(cards, search_note_id, card_index)
+        if not card:
             for _ in range(5):
                 try:
-                    self._page.evaluate("window.scrollBy(0, 800)")
+                    self._wheel_scroll(steps=1, minimum=600, maximum=900)
                 except Exception:
                     pass
-                time.sleep(1)
                 cards = self._get_all_cards()
-                if card_index < len(cards):
+                card = self._find_card_for_note(cards, search_note_id, card_index)
+                if card:
                     break
 
-        if card_index >= len(cards):
-            self.log(f"[详情] ✗ 未找到第{card_index}个卡片")
+        if not card:
+            self.log(
+                f"[详情] ✗ 未找到卡片 index={card_index} note_id={search_note_id}"
+            )
             return None
 
         # 点击前确保没有残留弹窗
         self._ensure_modal_closed()
-
-        card = cards[card_index]
 
         # 最多重试 2 次点击
         for attempt in range(3):
@@ -979,8 +1201,11 @@ class XhsSpider:
                     time.sleep(1)
                     # 重新获取卡片引用（页面可能已刷新）
                     cards = self._get_all_cards()
-                    if card_index < len(cards):
-                        card = cards[card_index]
+                    refreshed = self._find_card_for_note(
+                        cards, search_note_id, card_index
+                    )
+                    if refreshed:
+                        card = refreshed
                 else:
                     self.log(f"[详情] ✗ 第{card_index}个卡片重试{attempt+1}次均无弹窗")
                     try:
@@ -1002,7 +1227,6 @@ class XhsSpider:
         dom_nickname = (dom_data.get("nickname", "") if dom_data else "") or ""
 
         # 若传入的 search_note_data 的 note_id 与 DOM 实际打开的 note_id 不一致，打告警（列表API和卡片点击错位发生了）
-        search_note_id = (search_note_data.get("note_id", "") if search_note_data else "") or ""
         if search_note_data and search_note_id and dom_note_id and (search_note_id != dom_note_id):
             api_title = (search_note_data.get("title", "") or "")[:25]
             self.log(
@@ -1015,7 +1239,14 @@ class XhsSpider:
         note_id_for_share = dom_note_id or search_note_id
 
         # 获取分享链接（在弹窗关闭前）
-        share_link = self._get_share_link(note_id=note_id_for_share)
+        existing_share_link = self.db.get_existing_share_link(note_id_for_share)
+        if existing_share_link:
+            share_link = existing_share_link
+            share_link_attempted = False
+            self.log(f"[分享链接] 已有有效链接，跳过重复复制: {note_id_for_share}")
+        else:
+            share_link = self._get_share_link(note_id=note_id_for_share)
+            share_link_attempted = True
 
         try:
             close_btn = self._page.query_selector(".note-detail-mask .close-btn, .note-detail-mask .icon-close, .note-detail-mask [data-testid='close'], .note-detail-mask .m-close")
@@ -1095,9 +1326,9 @@ class XhsSpider:
             if dom_nickname:
                 self.log(f"[详情] nickname DOM未命中，退化使用搜索列表 nickname: '{dom_nickname[:15]}'")
 
-        # 获取粉丝数：优先用 DOM 提取的 author_user_id，其次用 search_note_data 的 user_id
+        # 粉丝数不参与当前动量/价值评分，主流程只读取缓存，不再后台请求作者主页。
         author_uid = dom_data.get("author_user_id", "") or (search_note_data.get("user_id", "") if search_note_data else "")
-        fans_count_val = self._fetch_fans_count(author_uid) if author_uid else 0
+        fans_count_val = self.db.get_user_fans(author_uid) if author_uid else 0
 
         # note_type：优先取 DOM（暂无提取），再退化搜索列表
         note_type_final = (search_note_data.get("note_type", "normal") if search_note_data else "normal") or "normal"
@@ -1123,6 +1354,9 @@ class XhsSpider:
             "engagement_score": engagement,
             "share_link": share_link or "",
             "url": share_link or "",  # DB 存储用
+            "share_link_status": "success" if share_link else "failed",
+            "share_link_attempted": share_link_attempted,
+            "share_link_error": "" if share_link else "复制链接失败",
         }
 
         self.log(f"[详情] ✓ '{detail['title'][:30]}' "
@@ -1152,6 +1386,13 @@ class XhsSpider:
             if n["note_id"] not in note_ids_seen:
                 note_ids_seen.add(n["note_id"])
                 all_notes.append(n)
+                self.db.link_task_note(
+                    self.task_id,
+                    n["note_id"],
+                    search_rank=len(all_notes),
+                    xsec_token=n.get("xsec_token", ""),
+                    title=n.get("title", ""),
+                )
 
         self.log(f"[任务] 第1页搜索到 {len(notes)} 条，累计 {len(all_notes)} 条")
 
@@ -1198,16 +1439,7 @@ class XhsSpider:
                 self.log(f"[任务] 等待 {delay:.1f}s 后滚动加载下一页...")
                 time.sleep(delay)
 
-                try:
-                    self._page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
-                    time.sleep(2)
-                    self._page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
-                except Exception:
-                    pass
-
-                time.sleep(3)
-
-                resp = self._find_api_with_items("search/notes")
+                resp = self._scroll_until_new_search_response(timeout_s=15)
                 if resp and resp["body"].get("code") == 0:
                     items = resp["body"].get("data", {}).get("items", []) or []
                     new_notes = self._parse_search_items(items)
@@ -1216,6 +1448,13 @@ class XhsSpider:
                         if n["note_id"] not in note_ids_seen:
                             note_ids_seen.add(n["note_id"])
                             all_notes.append(n)
+                            self.db.link_task_note(
+                                self.task_id,
+                                n["note_id"],
+                                search_rank=len(all_notes),
+                                xsec_token=n.get("xsec_token", ""),
+                                title=n.get("title", ""),
+                            )
                             new_count += 1
                     if new_count > 0:
                         self.log(f"[任务] 滚动后新增 {new_count} 条，累计 {len(all_notes)} 条")
@@ -1225,8 +1464,14 @@ class XhsSpider:
                     self.log(f"[任务] 滚动后未捕获到搜索 API")
 
         self.log(f"[任务] 本次抓取：{len(all_notes)} 条笔记，详情成功 {detailed_count} 条")
+        link_completion = self.db.get_link_completion(self.task_id)
+        task_status = "completed" if link_completion["missing"] == 0 else "partial"
+        self.log(
+            f"[链接完整性] {link_completion['completed']}/{link_completion['total']}，"
+            f"缺失 {link_completion['missing']} 条，任务状态={task_status}"
+        )
         self.db.update_task_status(
-            self.task_id, "completed",
+            self.task_id, task_status,
             success_count=self.success_count,
             fail_count=self.fail_count,
         )
@@ -1258,6 +1503,79 @@ class XhsSpider:
                 self.log(f"  - {out}")
 
         return all_notes
+
+    def retry_missing_links(self, task_id, limit=None):
+        """只补指定任务中尚未成功复制的分享链接。"""
+        task = self.db.get_task(task_id)
+        if not task:
+            raise ValueError(f"任务不存在: {task_id}")
+
+        pending = self.db.get_pending_share_links(task_id, limit=limit)
+        if not pending:
+            self.log(f"[补链接] 任务#{task_id} 没有缺失链接")
+            return {"total": 0, "success": 0, "failed": 0}
+
+        self._ensure_playwright()
+        success = 0
+        failed = 0
+        self.log(f"[补链接] 任务#{task_id} 待处理 {len(pending)} 条")
+
+        for index, item in enumerate(pending, 1):
+            note_id = item["note_id"]
+            token = item.get("xsec_token") or ""
+            if not token:
+                self.db.record_share_link_result(
+                    note_id,
+                    error="缺少 xsec_token，无法打开详情补链接",
+                )
+                failed += 1
+                self.log(f"[补链接] {index}/{len(pending)} ✗ {note_id} 缺少 xsec_token")
+                continue
+
+            detail_url = (
+                f"https://www.xiaohongshu.com/explore/{note_id}"
+                f"?xsec_token={quote(token, safe='')}&xsec_source=pc_search"
+            )
+            try:
+                self._page.goto(
+                    detail_url,
+                    wait_until="domcontentloaded",
+                    timeout=30000,
+                )
+                self._page.wait_for_timeout(random.randint(1800, 3000))
+                link = self._get_share_link(note_id=note_id) or ""
+                self.db.record_share_link_result(
+                    note_id,
+                    share_link=link,
+                    error="" if link else "复制链接失败",
+                )
+                if link:
+                    success += 1
+                    self.log(f"[补链接] {index}/{len(pending)} ✓ {note_id}")
+                else:
+                    failed += 1
+                    self.log(f"[补链接] {index}/{len(pending)} ✗ {note_id}")
+            except Exception as exc:
+                failed += 1
+                self.db.record_share_link_result(note_id, error=str(exc))
+                self.log(f"[补链接] {index}/{len(pending)} 异常: {exc}")
+
+            if index < len(pending):
+                time.sleep(random.uniform(4, 9))
+
+        completion = self.db.get_link_completion(task_id)
+        status = "completed" if completion["missing"] == 0 else "partial"
+        self.db.update_task_status(task_id, status)
+        self.log(
+            f"[补链接] 完成：成功={success} 失败={failed}，"
+            f"完整性={completion['completed']}/{completion['total']}，状态={status}"
+        )
+        return {
+            "total": len(pending),
+            "success": success,
+            "failed": failed,
+            **completion,
+        }
 
     def momentum_analysis(self, keyword, limit=999999, csv_file=None):
         self.log(f"[动量分析] 关键词='{keyword}'")

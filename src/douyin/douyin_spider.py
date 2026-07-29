@@ -16,13 +16,14 @@ from urllib.parse import quote
 
 try:
     from .douyin_util import (
-        DB_FILE, COOKIE_FILE, CookieManager, Database, build_douyin_page_url,
+        DB_FILE, COOKIE_FILE, Database, build_douyin_page_url,
     )
 except ImportError:
     from douyin_util import (
-        DB_FILE, COOKIE_FILE, CookieManager, Database, build_douyin_page_url,
+        DB_FILE, COOKIE_FILE, Database, build_douyin_page_url,
     )
 from src.common import paths
+from src.common.auth_state import AuthStateStore, LOGIN_MAX_AGE_DAYS
 
 
 def _parse_chinese_num(s):
@@ -48,8 +49,8 @@ def _parse_chinese_num(s):
 class DouyinSpider:
     def __init__(self, args, output_dir=None, mode="both"):
         self.args = args
-        self.cookie_mgr = CookieManager(COOKIE_FILE)
         self.db = Database(DB_FILE)
+        self.auth_state = AuthStateStore()
         self.task_id = None
         self.output_dir = output_dir
         self.mode = mode
@@ -92,51 +93,33 @@ class DouyinSpider:
 
     def _ensure_playwright(self):
         with self._pw_lock:
-            if self._browser is not None:
+            if self._context is not None:
                 return
             from playwright.sync_api import sync_playwright
             self._pw = sync_playwright().start()
 
             headless = getattr(self.args, "headless", True)
-
-            self._browser = self._pw.chromium.launch(
+            os.makedirs(os.path.dirname(paths.DOUYIN_EDGE_PROFILE), exist_ok=True)
+            self._context = self._pw.chromium.launch_persistent_context(
+                user_data_dir=paths.DOUYIN_EDGE_PROFILE,
                 channel="msedge",
                 headless=headless,
+                viewport={"width": 1920, "height": 1080},
+                permissions=["clipboard-read", "clipboard-write"],
                 args=[
                     "--disable-blink-features=AutomationControlled",
                     "--no-sandbox",
                     "--disable-dev-shm-usage",
                 ],
             )
-
-            cookie_str = self.cookie_mgr.get_cookie()
-            cookies_for_pw = []
-            if cookie_str:
-                for part in cookie_str.split(";"):
-                    part = part.strip()
-                    if "=" in part:
-                        k, v = part.split("=", 1)
-                        cookies_for_pw.append({
-                            "name": k.strip(),
-                            "value": v.strip(),
-                            "domain": ".douyin.com",
-                            "path": "/",
-                        })
-
-            self._context = self._browser.new_context(
-                viewport={"width": 1920, "height": 1080},
-                user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36 Edg/120.0.0.0",
-                permissions=["clipboard-read", "clipboard-write"],
-            )
-
-            if cookies_for_pw:
-                self._context.add_cookies(cookies_for_pw)
-                self.log(f"[浏览器] 已注入 {len(cookies_for_pw)} 个 cookie")
-
-            self._page = self._context.new_page()
+            self._browser = self._context.browser
+            self._page = self._context.pages[0] if self._context.pages else self._context.new_page()
             self._page.on("response", self._on_response)
 
-            self.log(f"[浏览器] Edge 浏览器已启动 (headless={headless})")
+            self.log(
+                f"[浏览器] Edge 持久化 profile 已启动 "
+                f"(headless={headless}, profile={paths.DOUYIN_EDGE_PROFILE})"
+            )
 
     def _on_response(self, response):
         url = response.url
@@ -146,7 +129,7 @@ class DouyinSpider:
         try:
             body = response.json()
             # 只记录有意义的 API 响应（包含 aweme 或 search 关键字）
-            if "aweme" in url or "search" in url or "item" in url:
+            if "aweme" in url or "search" in url or "item" in url or "/user/info" in url:
                 with self._api_lock:
                     self._api_responses.append({
                         "url": url,
@@ -233,8 +216,6 @@ class DouyinSpider:
             try:
                 if self._context:
                     self._context.close()
-                if self._browser:
-                    self._browser.close()
                 if self._pw:
                     self._pw.stop()
             except Exception:
@@ -262,6 +243,120 @@ class DouyinSpider:
             status = resp["body"].get("status_code") if resp else "无响应"
             self.log(f"[登录检测] ✗ 登录失效: status_code={status}")
             return False
+
+    def _latest_logged_in_user(self):
+        with self._api_lock:
+            responses = list(reversed(self._api_responses))
+        for resp in responses:
+            if "/user/info" not in resp["url"]:
+                continue
+            body = resp.get("body") or {}
+            if body.get("status_code") == 0:
+                user = body.get("user") or {}
+                return user.get("nickname") or "已登录用户"
+        return ""
+
+    def _save_current_cookies(self):
+        """导出 Cookie 仅作兼容备份；运行时不再向新 context 注入。"""
+        cookies = self._context.cookies("https://www.douyin.com")
+        cookie_str = "; ".join(
+            f"{cookie['name']}={cookie['value']}" for cookie in cookies
+        )
+        os.makedirs(os.path.dirname(COOKIE_FILE), exist_ok=True)
+        with open(COOKIE_FILE, "w", encoding="utf-8") as cookie_file:
+            cookie_file.write(cookie_str)
+        self.log(f"[登录刷新] 已保存 {len(cookies)} 个 Cookie")
+
+    def _clear_site_login_state(self):
+        """清除当前平台 profile 中的站点登录状态，保留 profile 本身。"""
+        self._context.clear_cookies()
+        try:
+            self._page.goto(
+                "https://www.douyin.com/",
+                wait_until="domcontentloaded",
+                timeout=30000,
+            )
+            self._page.evaluate("""async () => {
+                try { localStorage.clear(); } catch (_) {}
+                try { sessionStorage.clear(); } catch (_) {}
+                try {
+                    if (window.indexedDB && indexedDB.databases) {
+                        const dbs = await indexedDB.databases();
+                        await Promise.all((dbs || []).map(db => new Promise(resolve => {
+                            if (!db.name) return resolve();
+                            const req = indexedDB.deleteDatabase(db.name);
+                            req.onsuccess = req.onerror = req.onblocked = () => resolve();
+                        })));
+                    }
+                } catch (_) {}
+                try {
+                    if (window.caches) {
+                        const keys = await caches.keys();
+                        await Promise.all(keys.map(key => caches.delete(key)));
+                    }
+                } catch (_) {}
+                try {
+                    if (navigator.serviceWorker) {
+                        const regs = await navigator.serviceWorker.getRegistrations();
+                        await Promise.all(regs.map(reg => reg.unregister()));
+                    }
+                } catch (_) {}
+            }""")
+        except Exception as exc:
+            self.log(f"[登录刷新] 清理站点存储时出现非致命异常: {exc}")
+
+    def _force_interactive_login(self, timeout_s=180):
+        self.log("[登录刷新] 登录记录已超过3天或当前会话无效，强制刷新")
+        self._close_playwright()
+        self.args.headless = False
+        self._ensure_playwright()
+        self._clear_site_login_state()
+        self._clear_api()
+
+        self._page.goto(
+            "https://www.douyin.com/",
+            wait_until="domcontentloaded",
+            timeout=30000,
+        )
+        self._page.wait_for_timeout(2000)
+        try:
+            login_button = self._page.get_by_text("登录", exact=True).first
+            if login_button.is_visible():
+                login_button.click()
+        except Exception:
+            pass
+
+        self.log(f"[登录刷新] 请在浏览器中扫码登录，最多等待 {timeout_s} 秒...")
+        deadline = time.time() + timeout_s
+        while time.time() < deadline:
+            nickname = self._latest_logged_in_user()
+            if nickname:
+                self._save_current_cookies()
+                self.auth_state.mark_login("douyin")
+                self.log(f"[登录刷新] ✓ 登录成功: {nickname}")
+                return True
+            self._page.wait_for_timeout(1000)
+
+        self.log("[登录刷新] ✗ 等待扫码登录超时")
+        return False
+
+    def ensure_login_ready(self, max_age_days=LOGIN_MAX_AGE_DAYS):
+        """每次抓取前执行：3天内验证会话，超期或失效则强制扫码刷新。"""
+        state = self.auth_state.get("douyin")
+        if not self.auth_state.is_login_due("douyin", max_age_days=max_age_days):
+            last_login = state.get("last_login_at") if state else "?"
+            self.log(f"[登录门禁] 最近登录时间 {last_login}，未超过{max_age_days}天，验证现有会话")
+            if self.check_login():
+                self.auth_state.mark_verified("douyin")
+                self.log("[登录门禁] ✓ 持久化会话有效，无需重复扫码或注入 Cookie")
+                return True
+            self.log("[登录门禁] 会话验证失败，转为强制刷新")
+        else:
+            last_login = state.get("last_login_at") if state else None
+            reason = f"上次登录时间 {last_login}" if last_login else "没有登录时间记录"
+            self.log(f"[登录门禁] {reason}，需要强制刷新")
+
+        return self._force_interactive_login()
 
     def _parse_search_items(self, aweme_list):
         results = []
