@@ -49,6 +49,10 @@ class XhsDatabaseReliabilityTests(unittest.TestCase):
                 "note_id": "note-1",
                 "title": "标题",
                 "url": "https://xhslink.com/valid",
+                "author_url": (
+                    "https://www.xiaohongshu.com/user/profile/user-1"
+                    "?xsec_token=token"
+                ),
                 "share_link_attempted": True,
                 "liked_count": 10,
             },
@@ -79,8 +83,12 @@ class XhsDatabaseReliabilityTests(unittest.TestCase):
         self.assertEqual(
             self.db.get_link_completion(second_task)["missing"], 0
         )
+        food_results = self.db.get_keyword_momentum_ranking("美食")
+        self.assertEqual(len(food_results), 1)
         self.assertEqual(
-            len(self.db.get_keyword_momentum_ranking("美食")), 1
+            food_results[0]["author_url"],
+            "https://www.xiaohongshu.com/user/profile/user-1"
+            "?xsec_token=token",
         )
         self.assertEqual(
             len(self.db.get_keyword_momentum_ranking("旅行")), 1

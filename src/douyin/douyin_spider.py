@@ -98,7 +98,7 @@ class DouyinSpider:
             from playwright.sync_api import sync_playwright
             self._pw = sync_playwright().start()
 
-            headless = getattr(self.args, "headless", True)
+            headless = getattr(self.args, "headless", False)
             os.makedirs(os.path.dirname(paths.DOUYIN_EDGE_PROFILE), exist_ok=True)
             self._context = self._pw.chromium.launch_persistent_context(
                 user_data_dir=paths.DOUYIN_EDGE_PROFILE,
@@ -882,3 +882,21 @@ class DouyinSpider:
 
     def close(self):
         self._close_playwright()
+
+    def wait_for_manual_close(self):
+        """保持浏览器打开，直到用户手动关闭最后一个窗口。"""
+        if not self._context:
+            self.log("[浏览器] 当前没有已启动的浏览器")
+            return
+        self.log("[浏览器] 浏览器将保持打开，请手动关闭窗口以结束程序")
+        try:
+            while (
+                self._browser
+                and self._browser.is_connected()
+                and self._context.pages
+            ):
+                time.sleep(0.5)
+        except Exception:
+            pass
+        finally:
+            self._close_playwright()

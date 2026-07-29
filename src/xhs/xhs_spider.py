@@ -84,7 +84,7 @@ class XhsSpider:
             from playwright.sync_api import sync_playwright
             self._pw = sync_playwright().start()
 
-            headless = getattr(self.args, "headless", True)
+            headless = getattr(self.args, "headless", False)
             os.makedirs(os.path.dirname(paths.XHS_EDGE_PROFILE), exist_ok=True)
             self._context = self._pw.chromium.launch_persistent_context(
                 user_data_dir=paths.XHS_EDGE_PROFILE,
@@ -425,28 +425,41 @@ class XhsSpider:
             })
         return results
 
-    def search_notes(self, keyword, page=1, sort="general"):
-        self._ensure_playwright()
-        self._clear_api()
-        self.log(f"[搜索] 关键词='{keyword}' 第{page}页 排序={sort}")
-        self._page.goto(
-            "https://www.xiaohongshu.com/",
-            wait_until="domcontentloaded",
-            timeout=30000,
-        )
-        self._page.wait_for_timeout(1800)
-
-        search_input = None
+    def _find_visible_search_input(self):
+        """在当前页面查找可见且可用的搜索输入框。"""
         for selector in (
+            "#search-input-in-feeds",
+            "textarea[name='aiSearchTextarea']",
+            "textarea.textarea",
+            "#search-input",
+            "input.search-input",
             "input[placeholder*='搜索']",
             "input[type='search']",
             ".search-input input",
             "input[type='text']",
+            "textarea",
         ):
-            candidate = self._page.query_selector(selector)
-            if candidate and candidate.is_visible():
-                search_input = candidate
-                break
+            for candidate in self._page.query_selector_all(selector):
+                if candidate.is_visible() and candidate.is_enabled():
+                    return candidate
+        return None
+
+    def search_notes(self, keyword, page=1, sort="general"):
+        self._ensure_playwright()
+        self._clear_api()
+        self.log(f"[搜索] 关键词='{keyword}' 第{page}页 排序={sort}")
+        search_input = self._find_visible_search_input()
+        if search_input:
+            self.log(f"[搜索] 复用当前页面: {self._page.url}")
+        else:
+            self.log("[搜索] 当前页面没有搜索框，访问小红书首页")
+            self._page.goto(
+                "https://www.xiaohongshu.com/",
+                wait_until="domcontentloaded",
+                timeout=30000,
+            )
+            self._page.wait_for_timeout(1800)
+            search_input = self._find_visible_search_input()
 
         if not search_input:
             self.log("[搜索] ✗ 首页未找到可见搜索框")
@@ -648,6 +661,11 @@ class XhsSpider:
                     const href = authorLink.getAttribute('href') || '';
                     const m = href.match(/\/user\/profile\/([a-f0-9]+)/);
                     if (m) result.author_user_id = m[1];
+                    try {
+                        result.author_url = new URL(href, location.origin).href;
+                    } catch (_) {
+                        result.author_url = href;
+                    }
                 }
 
                 // ── note_id（备用） ────────────────────────────────────────
@@ -828,18 +846,57 @@ class XhsSpider:
                 return ""
             return best_url
 
+        def _find_share_button():
+            """只在当前详情区域找分享按钮，优先返回视口内的可见元素。"""
+            mask = self._page.query_selector(".note-detail-mask")
+            scope = mask if mask and mask.is_visible() else self._page
+            selectors = (
+                ".buttons[data-v-2820500a] .share-icon",
+                ".share-icon-container",
+                "[class~='share-icon']",
+                "[aria-label*='分享']",
+                "[title*='分享']",
+            )
+            visible_candidates = []
+            viewport = self._page.evaluate(
+                "() => ({width: window.innerWidth, height: window.innerHeight})"
+            )
+            for selector in selectors:
+                for candidate in scope.query_selector_all(selector):
+                    try:
+                        if not candidate.is_visible() or not candidate.is_enabled():
+                            continue
+                        box = candidate.bounding_box()
+                        if (
+                            box
+                            and box["x"] + box["width"] > 0
+                            and box["y"] + box["height"] > 0
+                            and box["x"] < viewport["width"]
+                            and box["y"] < viewport["height"]
+                        ):
+                            return candidate
+                        visible_candidates.append(candidate)
+                    except Exception:
+                        continue
+            return visible_candidates[0] if visible_candidates else None
+
         try:
             # 1. 点击分享按钮
-            share_btn = self._page.query_selector(
-                ".note-detail-mask .buttons[data-v-2820500a] .share-icon, "
-                ".note-detail-mask .share-icon-container, "
-                ".note-detail-mask [class*='share-icon'], "
-                ".buttons .share-icon, .share-icon-container, [class*='share-icon']"
-            )
+            share_btn = _find_share_button()
             if not share_btn:
                 self.log("[分享链接] 未找到分享按钮")
                 return None
-            share_btn.click()
+            try:
+                share_btn.evaluate(
+                    "(el) => el.scrollIntoView({block: 'center', inline: 'center'})"
+                )
+                self._page.wait_for_timeout(250)
+                share_btn.click(timeout=5000)
+            except Exception as click_error:
+                # 元素已经限定在当前详情区域且确认可见；内部滚动容器仍可能
+                # 让 Playwright 误判为视口外，此时用 DOM click 作为可靠性兜底。
+                self.log(f"[分享链接] 常规点击失败，使用详情内 DOM 点击兜底: {click_error}")
+                share_btn.evaluate("(el) => el.click()")
             time.sleep(1.2)
 
             # 2. 等分享弹窗（两种都可能）
@@ -1344,6 +1401,7 @@ class XhsSpider:
             "interact_count": interact,
             "nickname": dom_nickname,
             "user_id": author_uid,
+            "author_url": dom_data.get("author_url", ""),
             "fans_count": fans_count_val,
             "pub_time": pub_time,
             "pub_time_ms": pub_time_ms,
@@ -1650,3 +1708,21 @@ class XhsSpider:
 
     def close(self):
         self._close_playwright()
+
+    def wait_for_manual_close(self):
+        """保持浏览器打开，直到用户手动关闭最后一个窗口。"""
+        if not self._context:
+            self.log("[浏览器] 当前没有已启动的浏览器")
+            return
+        self.log("[浏览器] 浏览器将保持打开，请手动关闭窗口以结束程序")
+        try:
+            while (
+                self._browser
+                and self._browser.is_connected()
+                and self._context.pages
+            ):
+                time.sleep(0.5)
+        except Exception:
+            pass
+        finally:
+            self._close_playwright()

@@ -117,6 +117,7 @@ class Database:
                 share_count INTEGER DEFAULT 0,
                 nickname TEXT,
                 user_id TEXT,
+                author_url TEXT,
                 fans_count INTEGER DEFAULT 0,
                 pub_time DATETIME,
                 note_type TEXT,
@@ -142,6 +143,7 @@ class Database:
             "share_link_attempts": "INTEGER DEFAULT 0",
             "share_link_error": "TEXT",
             "share_link_fetched_at": "DATETIME",
+            "author_url": "TEXT",
         }
         for column, definition in note_column_migrations.items():
             if column not in existing_note_columns:
@@ -449,6 +451,7 @@ class Database:
                     share_count = ?,
                     nickname = ?,
                     user_id = ?,
+                    author_url = COALESCE(NULLIF(?, ''), author_url),
                     fans_count = ?,
                     pub_time = ?,
                     note_type = ?,
@@ -476,6 +479,7 @@ class Database:
                 note_data.get("share_count", 0),
                 note_data.get("nickname"),
                 note_data.get("user_id"),
+                note_data.get("author_url"),
                 note_data.get("fans_count", 0),
                 note_data.get("pub_time"),
                 note_data.get("note_type"),
@@ -498,11 +502,11 @@ class Database:
                 INSERT INTO xhs_notes (
                     task_id, note_id, title, url, xsec_token,
                     interact_count, liked_count, collected_count, comment_count, share_count,
-                    nickname, user_id, fans_count, pub_time, note_type,
+                    nickname, user_id, author_url, fans_count, pub_time, note_type,
                     description, tags, category, note_age_hours, interact_velocity,
                     engagement_score, fetched_at, share_link_status,
                     share_link_attempts, share_link_error, share_link_fetched_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (
                 task_id, note_id,
                 note_data.get("title"),
@@ -515,6 +519,7 @@ class Database:
                 note_data.get("share_count", 0),
                 note_data.get("nickname"),
                 note_data.get("user_id"),
+                note_data.get("author_url"),
                 note_data.get("fans_count", 0),
                 note_data.get("pub_time"),
                 note_data.get("note_type"),
@@ -612,7 +617,8 @@ class Database:
         cursor.execute("""
             SELECT n.note_id, n.title, n.interact_count, n.pub_time, n.nickname, n.user_id, n.fans_count,
                    n.interact_velocity, n.note_age_hours, n.engagement_score,
-                   n.comment_count, n.liked_count, n.collected_count, n.share_count, n.tags, n.url
+                   n.comment_count, n.liked_count, n.collected_count, n.share_count,
+                   n.tags, n.url, n.author_url
             FROM xhs_notes n
             WHERE n.note_id IN (
                 SELECT tn.note_id
@@ -654,7 +660,8 @@ class Database:
         for note in notes:
             (note_id, title, interact_count, pub_time, nickname, user_id, fans_count,
              interact_velocity, note_age_hours, engagement_raw,
-             comment_count, liked_count, collected_count, share_count, tags_str, url_str) = note
+             comment_count, liked_count, collected_count, share_count, tags_str,
+             url_str, author_url_str) = note
 
             interact_count = int(interact_count or 0)
             interact_velocity = float(interact_velocity or 0)
@@ -702,6 +709,10 @@ class Database:
                 "pub_time": pub_time,
                 "nickname": nickname,
                 "user_id": user_id,
+                "author_url": author_url_str or (
+                    f"https://www.xiaohongshu.com/user/profile/{user_id}"
+                    if user_id else ""
+                ),
                 "interact_velocity": round(interact_velocity, 2),
                 "engagement_score": round(engagement_raw, 4),
                 "note_age_hours": round(note_age_hours, 1),
@@ -739,7 +750,8 @@ class Database:
         cursor.execute("""
             SELECT n.note_id, n.title, n.interact_count, n.pub_time, n.nickname, n.user_id, n.fans_count,
                    n.note_age_hours, n.engagement_score, n.comment_count,
-                   n.liked_count, n.collected_count, n.share_count, n.tags, n.url
+                   n.liked_count, n.collected_count, n.share_count,
+                   n.tags, n.url, n.author_url
             FROM xhs_notes n
             WHERE n.note_id IN (
                 SELECT tn.note_id
@@ -784,7 +796,8 @@ class Database:
         for note in notes:
             (note_id, title, interact_count, pub_time, nickname, user_id, fans_count,
              note_age_hours, engagement_raw, comment_count,
-             liked_count, collected_count, share_count, tags_str, url_str) = note
+             liked_count, collected_count, share_count, tags_str,
+             url_str, author_url_str) = note
 
             liked = int(liked_count or 0)
             collected = int(collected_count or 0)
@@ -816,6 +829,10 @@ class Database:
                 "interact_count": interact,
                 "nickname": nickname,
                 "user_id": user_id,
+                "author_url": author_url_str or (
+                    f"https://www.xiaohongshu.com/user/profile/{user_id}"
+                    if user_id else ""
+                ),
                 "liked_count": liked,
                 "collected_count": collected,
                 "comment_count": comment,
@@ -840,7 +857,8 @@ class Database:
         with open(csv_file, "w", encoding="utf-8-sig", newline="") as f:
             writer = csv.writer(f)
             writer.writerow([
-                "排名", "note_id", "分享链接", "标题", "互动量", "作者", "作者UID",
+                "排名", "note_id", "分享链接", "标题", "互动量", "作者",
+                "作者UID", "博主主页链接",
                 "互动速率(次/小时)", "笔记年龄(小时)", "互动密度", "评论数", "标签",
                 "速率得分", "互动得分", "新鲜度得分", "互动量得分",
                 "历史增长%", "数据点数量", "发布时间", "综合评分"
@@ -854,6 +872,7 @@ class Database:
                     item.get("current_value", 0),
                     item.get("nickname", ""),
                     item.get("user_id", ""),
+                    item.get("author_url", ""),
                     item.get("interact_velocity", 0),
                     item.get("note_age_hours", 0),
                     item.get("engagement_score", 0),
@@ -875,7 +894,8 @@ class Database:
         with open(csv_file, "w", encoding="utf-8-sig", newline="") as f:
             writer = csv.writer(f)
             writer.writerow([
-                "排名", "note_id", "分享链接", "标题", "互动量", "作者", "作者UID",
+                "排名", "note_id", "分享链接", "标题", "互动量", "作者",
+                "作者UID", "博主主页链接",
                 "点赞数", "收藏数", "评论数",
                 "标签", "收藏率", "互动密度", "评论率",
                 "收藏得分", "互动得分", "评论得分",
@@ -890,6 +910,7 @@ class Database:
                     item.get("interact_count", 0),
                     item.get("nickname", ""),
                     item.get("user_id", ""),
+                    item.get("author_url", ""),
                     item.get("liked_count", 0),
                     item.get("collected_count", 0),
                     item.get("comment_count", 0),

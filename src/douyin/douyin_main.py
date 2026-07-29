@@ -44,7 +44,25 @@ def main():
     search_p = sub.add_parser("search", help="搜索爬取视频 + 自动分析")
     search_p.add_argument("-k", "--keyword", required=True, help="搜索关键词")
     search_p.add_argument("-p", "--pages", type=int, default=3, help="爬取页数 (默认3)")
-    search_p.add_argument("--headed", action="store_true", help="有头模式（显示浏览器，默认无头）")
+    search_display = search_p.add_mutually_exclusive_group()
+    search_display.add_argument(
+        "--headed",
+        dest="headless",
+        action="store_false",
+        help="有头模式（默认）",
+    )
+    search_display.add_argument(
+        "--headless",
+        dest="headless",
+        action="store_true",
+        help="无头模式",
+    )
+    search_p.set_defaults(headless=False)
+    search_p.add_argument(
+        "--keep-open",
+        action="store_true",
+        help="任务结束后等待手动关闭浏览器",
+    )
 
     sub.add_parser("check-login", help="检测登录态是否有效")
 
@@ -72,7 +90,6 @@ def main():
             spider.close()
 
     elif args.command == "search":
-        args.headless = not args.headed
         from src.common import paths
         output_dir = paths.output(args.keyword)
         spider = DouyinSpider(args, output_dir=output_dir, mode=args.mode)
@@ -89,7 +106,10 @@ def main():
             import traceback
             traceback.print_exc()
         finally:
-            spider.close()
+            if args.keep_open:
+                spider.wait_for_manual_close()
+            else:
+                spider.close()
 
     elif args.keyword:
         mode = args.mode

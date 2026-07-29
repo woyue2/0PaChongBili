@@ -52,13 +52,49 @@ def main():
     search_p.add_argument("-s", "--sort", default="general",
                           choices=["general", "popular", "new"],
                           help="排序方式: general综合(默认), popular最热, new最新")
-    search_p.add_argument("--headed", action="store_true", help="有头模式（显示浏览器，默认无头）")
+    search_display = search_p.add_mutually_exclusive_group()
+    search_display.add_argument(
+        "--headed",
+        dest="headless",
+        action="store_false",
+        help="有头模式（默认）",
+    )
+    search_display.add_argument(
+        "--headless",
+        dest="headless",
+        action="store_true",
+        help="无头模式",
+    )
+    search_p.set_defaults(headless=False)
+    search_p.add_argument(
+        "--keep-open",
+        action="store_true",
+        help="任务结束后等待手动关闭浏览器",
+    )
 
     sub.add_parser("check-login", help="检测登录态是否有效")
     retry_p = sub.add_parser("retry-links", help="只补指定任务中缺失的分享链接")
     retry_p.add_argument("--task-id", type=int, required=True, help="原抓取任务 ID")
     retry_p.add_argument("--limit", type=int, help="本次最多补多少条")
-    retry_p.add_argument("--headed", action="store_true", help="有头模式（显示浏览器）")
+    retry_display = retry_p.add_mutually_exclusive_group()
+    retry_display.add_argument(
+        "--headed",
+        dest="headless",
+        action="store_false",
+        help="有头模式（默认）",
+    )
+    retry_display.add_argument(
+        "--headless",
+        dest="headless",
+        action="store_true",
+        help="无头模式",
+    )
+    retry_p.set_defaults(headless=False)
+    retry_p.add_argument(
+        "--keep-open",
+        action="store_true",
+        help="任务结束后等待手动关闭浏览器",
+    )
 
     args = parser.parse_args()
 
@@ -81,7 +117,6 @@ def main():
             spider.close()
 
     elif args.command == "search":
-        args.headless = not args.headed
         from src.common import paths
         output_dir = paths.output(args.keyword)
         spider = XhsSpider(args, output_dir=output_dir, mode=args.mode)
@@ -99,10 +134,12 @@ def main():
             import traceback
             traceback.print_exc()
         finally:
-            spider.close()
+            if args.keep_open:
+                spider.wait_for_manual_close()
+            else:
+                spider.close()
 
     elif args.command == "retry-links":
-        args.headless = not args.headed
         spider = XhsSpider(args)
         try:
             if not spider.ensure_login_ready():
@@ -110,7 +147,10 @@ def main():
                 sys.exit(1)
             spider.retry_missing_links(args.task_id, limit=args.limit)
         finally:
-            spider.close()
+            if args.keep_open:
+                spider.wait_for_manual_close()
+            else:
+                spider.close()
 
     elif args.keyword:
         mode = args.mode
