@@ -15,9 +15,13 @@ from datetime import datetime
 from urllib.parse import quote
 
 try:
-    from .douyin_util import DB_FILE, COOKIE_FILE, CookieManager, Database
+    from .douyin_util import (
+        DB_FILE, COOKIE_FILE, CookieManager, Database, build_douyin_page_url,
+    )
 except ImportError:
-    from douyin_util import DB_FILE, COOKIE_FILE, CookieManager, Database
+    from douyin_util import (
+        DB_FILE, COOKIE_FILE, CookieManager, Database, build_douyin_page_url,
+    )
 from src.common import paths
 
 
@@ -332,6 +336,7 @@ class DouyinSpider:
                 "note_age_hours": note_age_hours,
                 "interact_velocity": interact_velocity,
                 "engagement_score": interact_count,  # 用互动总数做初始评分
+                "page_url": build_douyin_page_url(aweme_id),
                 "video_url": play_addr,
                 "note_type": aweme_info.get("aweme_type", 0),
                 "source": "search",

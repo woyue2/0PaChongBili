@@ -17,6 +17,12 @@ from src.common import paths as _paths
 DB_FILE = _paths.DOUYIN_DB
 COOKIE_FILE = _paths.DOUYIN_COOKIE
 
+
+def build_douyin_page_url(aweme_id):
+    """生成可打开作品详情和评论区的抖音作品页链接。"""
+    return f"https://www.douyin.com/video/{aweme_id}" if aweme_id else ""
+
+
 USER_AGENTS = [
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36",
@@ -484,6 +490,7 @@ class Database:
                 "comment_activity_score": round(comment_activity_score, 4),
                 "composite_score": round(composite_score, 4),
                 "tags": tags_str or "",
+                "page_url": build_douyin_page_url(aweme_id),
                 "video_url": video_url or "",
             }
             results.append(note_info)
@@ -602,6 +609,7 @@ class Database:
                 "value_score": round(value_score, 4),
                 "note_age_hours": float(note_age_hours or 0),
                 "pub_time": pub_time_str,
+                "page_url": build_douyin_page_url(aweme_id),
                 "video_url": video_url or "",
             })
 
@@ -613,7 +621,7 @@ class Database:
         with open(csv_file, "w", encoding="utf-8-sig", newline="") as f:
             writer = csv.writer(f)
             writer.writerow([
-                "排名", "aweme_id", "视频链接", "标题", "互动总数", "作者", "作者UID",
+                "排名", "aweme_id", "作品页链接（含评论区）", "视频直链", "标题", "互动总数", "作者", "作者UID",
                 "互动速率(次/小时)", "视频年龄(小时)", "评论数", "点赞数", "分享数", "收藏数", "标签",
                 "速率得分", "密度得分", "新鲜度得分", "评论活跃度得分",
                 "发布时间", "动量综合评分"
@@ -622,6 +630,7 @@ class Database:
                 writer.writerow([
                     i,
                     item["aweme_id"],
+                    item.get("page_url") or build_douyin_page_url(item["aweme_id"]),
                     item.get("video_url", ""),
                     item["title"],
                     item.get("total_interact", 0),
@@ -648,7 +657,7 @@ class Database:
         with open(csv_file, "w", encoding="utf-8-sig", newline="") as f:
             writer = csv.writer(f)
             writer.writerow([
-                "排名", "aweme_id", "视频链接", "标题", "互动总数", "作者", "作者UID",
+                "排名", "aweme_id", "作品页链接（含评论区）", "视频直链", "标题", "互动总数", "作者", "作者UID",
                 "点赞数", "收藏数", "评论数", "分享数",
                 "标签", "收藏率", "分享率", "评论率", "互动率",
                 "收藏得分", "分享得分", "评论得分", "互动得分",
@@ -658,6 +667,7 @@ class Database:
                 writer.writerow([
                     i,
                     item["aweme_id"],
+                    item.get("page_url") or build_douyin_page_url(item["aweme_id"]),
                     item.get("video_url", ""),
                     item["title"],
                     item.get("total_interact", 0),
