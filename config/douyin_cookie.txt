@@ -1,0 +1,2 @@
+# 抖音 Cookie 文件
+# 请运行 python src/douyin/douyin_main.py login 进行扫码登录
