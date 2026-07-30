@@ -54,18 +54,22 @@ BILI_COOKIE = config("bili_cookie.txt")
 XHS_COOKIE = config("xhs_cookie.txt")
 XHS_COOKIE_ORIGIN = config("xhs_cookie_origin.txt")
 DOUYIN_COOKIE = config("douyin_cookie.txt")
+KUAISHOU_COOKIE = config("kuaishou_cookie.txt")
 
 # 日志目录
 BILI_LOGS = logs("bili")
 XHS_LOGS = logs("xhs")
 DOUYIN_LOGS = logs("dy")
+KUAISHOU_LOGS = logs("kuaishou")
 
 # 数据库文件
 BILI_DB = data("bili_spider.db")
 XHS_DB = data("xhs_spider.db")
 XHS_TEST_DB = data("xhs_test_tmp.db")
 DOUYIN_DB = data("douyin_spider.db")
+KUAISHOU_DB = data("kuaishou_spider.db")
 
 # 浏览器 profile
 XHS_EDGE_PROFILE = profile("xhs_edge_profile")
 DOUYIN_EDGE_PROFILE = profile("douyin_edge_profile")
+KUAISHOU_EDGE_PROFILE = profile("kuaishou_edge_profile")
