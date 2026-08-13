@@ -29,3 +29,6 @@ xhs_result.txt
 xhs_login_*.log
 xhs_listen_*.log
 xhs_test_*.log
+
+# 外部参考代码（如 OpenBiliClaw 下载副本）
+refer/

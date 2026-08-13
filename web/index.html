@@ -1,0 +1,441 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>0PaChongBili 爬虫控制台</title>
+<style>
+  :root {
+    --bg: #0d1117;
+    --panel: #161b22;
+    --border: #30363d;
+    --text: #e6edf3;
+    --muted: #8b949e;
+    --accent: #2f81f7;
+    --green: #3fb950;
+    --yellow: #d29922;
+    --red: #f85149;
+    --term-bg: #010409;
+    --term-text: #7ee787;
+    --term-dim: #3fb950;
+  }
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body {
+    background: var(--bg);
+    color: var(--text);
+    font-family: "Segoe UI", "Microsoft YaHei", sans-serif;
+    min-height: 100vh;
+  }
+  header {
+    padding: 16px 24px;
+    border-bottom: 1px solid var(--border);
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    background: var(--panel);
+  }
+  header h1 { font-size: 18px; font-weight: 600; }
+  header .badge {
+    font-size: 12px;
+    color: var(--muted);
+    border: 1px solid var(--border);
+    border-radius: 20px;
+    padding: 2px 10px;
+  }
+  header .status-dot {
+    width: 8px; height: 8px; border-radius: 50%;
+    background: var(--green);
+    display: inline-block;
+  }
+  main { display: flex; gap: 16px; padding: 16px 24px; align-items: flex-start; }
+  .col-left { width: 380px; flex-shrink: 0; display: flex; flex-direction: column; gap: 16px; }
+  .col-right { flex: 1; min-width: 0; }
+
+  .card {
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 16px;
+  }
+  .card h2 { font-size: 14px; margin-bottom: 12px; color: var(--muted); font-weight: 600; }
+
+  .form-row { margin-bottom: 12px; }
+  .form-row label { display: block; font-size: 12px; color: var(--muted); margin-bottom: 4px; }
+  .form-row input, .form-row select {
+    width: 100%;
+    padding: 8px 10px;
+    background: var(--bg);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    color: var(--text);
+    font-size: 14px;
+  }
+  .form-row input:focus, .form-row select:focus {
+    outline: none;
+    border-color: var(--accent);
+  }
+  .form-inline { display: flex; gap: 8px; }
+  .form-inline .form-row { flex: 1; }
+
+  button {
+    padding: 9px 16px;
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    background: var(--bg);
+    color: var(--text);
+    font-size: 14px;
+    cursor: pointer;
+    transition: background .15s;
+  }
+  button:hover { background: #21262d; }
+  button.primary {
+    background: var(--accent);
+    border-color: var(--accent);
+    color: #fff;
+    font-weight: 600;
+    width: 100%;
+  }
+  button.primary:hover { background: #1f6feb; }
+  button.danger { color: var(--red); border-color: var(--red); }
+  button.danger:hover { background: rgba(248,81,73,.1); }
+  button:disabled { opacity: .5; cursor: not-allowed; }
+  .hint { font-size: 11px; color: var(--muted); margin-top: 6px; }
+
+  /* 任务列表 */
+  .task-item {
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 10px 12px;
+    margin-bottom: 8px;
+    cursor: pointer;
+    transition: border-color .15s, background .15s;
+  }
+  .task-item:hover { border-color: var(--accent); }
+  .task-item.active { border-color: var(--accent); background: rgba(47,129,247,.06); }
+  .task-item .t-head { display: flex; justify-content: space-between; align-items: center; margin-bottom: 6px; }
+  .task-item .t-title { font-size: 13px; font-weight: 600; }
+  .task-item .t-time { font-size: 11px; color: var(--muted); }
+  .task-item .t-meta { font-size: 11px; color: var(--muted); margin-bottom: 6px; }
+  .task-item .t-progress { height: 3px; background: var(--bg); border-radius: 2px; overflow: hidden; }
+  .task-item .t-progress .bar { height: 100%; width: 0; background: var(--accent); transition: width .3s; }
+
+  .status-pill {
+    font-size: 11px;
+    padding: 2px 8px;
+    border-radius: 10px;
+    border: 1px solid;
+  }
+  .status-running { color: var(--accent); border-color: var(--accent); }
+  .status-starting { color: var(--yellow); border-color: var(--yellow); }
+  .status-finished { color: var(--green); border-color: var(--green); }
+  .status-failed { color: var(--red); border-color: var(--red); }
+  .status-killed { color: var(--muted); border-color: var(--border); }
+
+  .empty {
+    color: var(--muted);
+    font-size: 13px;
+    text-align: center;
+    padding: 24px 0;
+  }
+
+  /* 终端 */
+  .terminal {
+    background: var(--term-bg);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    font-family: "Cascadia Code", Consolas, "Courier New", monospace;
+    font-size: 12.5px;
+    line-height: 1.55;
+    height: calc(100vh - 160px);
+    min-height: 400px;
+    overflow-y: auto;
+    padding: 12px 14px;
+    white-space: pre-wrap;
+    word-break: break-all;
+    color: var(--term-text);
+    position: relative;
+  }
+  .terminal::-webkit-scrollbar { width: 10px; }
+  .terminal::-webkit-scrollbar-thumb { background: #30363d; border-radius: 5px; }
+  .terminal .term-header {
+    position: sticky; top: 0;
+    background: var(--term-bg);
+    display: flex; justify-content: space-between; align-items: center;
+    padding-bottom: 8px; margin-bottom: 8px;
+    border-bottom: 1px solid #21262d;
+    font-family: "Segoe UI", sans-serif;
+    font-size: 12px;
+    color: var(--muted);
+  }
+  .terminal .line { animation: fadeIn .12s ease; }
+  .terminal .line.dim { color: var(--term-dim); }
+  .terminal .line.red { color: var(--red); }
+  .terminal .line.yellow { color: var(--yellow); }
+  @keyframes fadeIn { from { opacity: 0; } to { opacity: 1; } }
+  .terminal .cursor { display: inline-block; width: 8px; height: 14px; background: var(--term-text); animation: blink 1s step-end infinite; vertical-align: -2px; }
+  @keyframes blink { 50% { opacity: 0; } }
+  .term-actions { display: flex; gap: 8px; }
+  .term-empty { color: var(--muted); }
+</style>
+</head>
+<body>
+
+<header>
+  <h1>🦞 0PaChongBili 爬虫控制台</h1>
+  <span class="badge"><span class="status-dot" id="healthDot"></span> <span id="healthText">连接中...</span></span>
+</header>
+
+<main>
+  <div class="col-left">
+    <!-- 新建任务 -->
+    <div class="card">
+      <h2>🚀 新建爬取任务</h2>
+      <div class="form-row">
+        <label>平台</label>
+        <select id="platform">
+          <option value="bili">B站</option>
+          <option value="xhs">小红书</option>
+          <option value="douyin">抖音</option>
+          <option value="kuaishou">快手</option>
+        </select>
+      </div>
+      <div class="form-row">
+        <label>关键词</label>
+        <input id="keyword" placeholder="例如: 服饰、美食、阶级跨越" value="服饰">
+      </div>
+      <div class="form-inline">
+        <div class="form-row">
+          <label>页数</label>
+          <input id="pages" type="number" min="1" max="50" value="3">
+        </div>
+        <div class="form-row" id="modeRow" style="display:none;">
+          <label>模式</label>
+          <select id="mode">
+            <option value="search">双分析</option>
+            <option value="momentum">仅动量</option>
+            <option value="value">仅价值</option>
+          </select>
+        </div>
+      </div>
+      <button class="primary" id="startBtn">▶ 开始爬取</button>
+      <div class="hint">提示: 小红书/抖音/快手会弹出浏览器窗口，需要保持登录态；B站无需浏览器。</div>
+    </div>
+
+    <!-- 任务列表 -->
+    <div class="card">
+      <h2>📋 任务列表</h2>
+      <div id="taskList"><div class="empty">暂无任务</div></div>
+    </div>
+  </div>
+
+  <!-- 终端 -->
+  <div class="col-right">
+    <div class="terminal" id="terminal">
+      <div class="term-header">
+        <span id="termTitle">⬅ 选择左侧任务查看实时输出</span>
+        <span class="term-actions">
+          <button id="clearTerm" style="padding:3px 10px; font-size:12px;">清空</button>
+          <button id="autoScrollBtn" style="padding:3px 10px; font-size:12px;">自动滚动: 开</button>
+        </span>
+      </div>
+      <div id="termBody"><span class="term-empty">还没有选择任务。启动任务后，爬虫的 print 输出会实时显示在这里。</span></div>
+    </div>
+  </div>
+</main>
+
+<script>
+const $ = id => document.getElementById(id);
+let currentTaskId = null;
+let es = null;
+let autoScroll = true;
+let pollTimer = null;
+
+// ---------- 工具 ----------
+async function api(url, opts = {}) {
+  const res = await fetch(url, opts);
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) throw new Error(data.error || `HTTP ${res.status}`);
+  return data;
+}
+
+function fmtTime(ts) {
+  if (!ts) return '';
+  const d = new Date(ts * 1000);
+  const p = n => String(n).padStart(2, '0');
+  return `${p(d.getMonth()+1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}`;
+}
+
+function lineClass(text) {
+  if (/\[(错误|失败|Error|Traceback|Exception)/.test(text)) return 'red';
+  if (/\[(限流|警告|WARNING|中断)/.test(text)) return 'yellow';
+  if (/^={5,}|^[-]{5,}|提示|说明/.test(text)) return 'dim';
+  return '';
+}
+
+// ---------- 终端 ----------
+function termAppend(text, cls = '') {
+  const body = $('termBody');
+  // 移除初始空态
+  const empty = body.querySelector('.term-empty');
+  if (empty) empty.remove();
+  const div = document.createElement('div');
+  div.className = 'line' + (cls ? ' ' + cls : '');
+  div.textContent = text;
+  body.appendChild(div);
+  if (autoScroll) {
+    const term = $('terminal');
+    term.scrollTop = term.scrollHeight;
+  }
+  // 限制 DOM 行数，防止卡顿
+  while (body.children.length > 3000) body.removeChild(body.firstChild);
+}
+
+function termStatus(text) {
+  const body = $('termBody');
+  const empty = body.querySelector('.term-empty');
+  if (empty) empty.remove();
+  const div = document.createElement('div');
+  div.className = 'line dim';
+  div.textContent = '── ' + text;
+  body.appendChild(div);
+  if (autoScroll) {
+    const term = $('terminal');
+    term.scrollTop = term.scrollHeight;
+  }
+}
+
+// ---------- SSE 订阅 ----------
+function subscribe(taskId) {
+  if (es) { es.close(); es = null; }
+  currentTaskId = taskId;
+  const body = $('termBody');
+  body.innerHTML = '<span class="term-empty">连接中...</span>';
+
+  es = new EventSource(`/api/tasks/${taskId}/logs`);
+  es.onmessage = e => termAppend(e.data, lineClass(e.data));
+  es.addEventListener('done', e => {
+    let status = 'finished';
+    try { status = JSON.parse(e.data).status; } catch (_) {}
+    termStatus(`[任务结束] 状态: ${status}`);
+    es.close();
+    es = null;
+    refreshTasks();
+  });
+  es.onerror = () => {
+    // EventSource 自动重连；仅当任务已结束时停止
+    const task = tasksMap[currentTaskId];
+    if (task && ['finished','failed','killed'].includes(task.status)) {
+      es.close(); es = null;
+    }
+  };
+}
+
+// ---------- 任务列表 ----------
+let tasksMap = {};
+async function refreshTasks() {
+  try {
+    const tasks = await api('/api/tasks');
+    tasksMap = {};
+    const list = $('taskList');
+    if (!tasks.length) {
+      list.innerHTML = '<div class="empty">暂无任务</div>';
+      return;
+    }
+    list.innerHTML = '';
+    tasks.forEach(t => {
+      tasksMap[t.id] = t;
+      const item = document.createElement('div');
+      item.className = 'task-item' + (t.id === currentTaskId ? ' active' : '');
+      const isRunning = t.status === 'running' || t.status === 'starting';
+      item.innerHTML = `
+        <div class="t-head">
+          <span class="t-title">[${t.platform_name}] ${escapeHtml(t.keyword)}</span>
+          <span class="status-pill status-${t.status}">${statusText(t.status)}</span>
+        </div>
+        <div class="t-meta">页数: ${t.pages} · ${t.mode || '-'} · ${fmtTime(t.created_at)} · ${t.line_count} 行</div>
+        ${isRunning ? '<div class="t-progress"><div class="bar" style="animation: pulse 1.2s infinite;"></div></div>' : ''}
+      `;
+      item.onclick = () => { subscribe(t.id); refreshTasks(); };
+      list.appendChild(item);
+    });
+  } catch (e) {
+    $('taskList').innerHTML = `<div class="empty">加载失败: ${escapeHtml(e.message)}</div>`;
+  }
+}
+
+function statusText(s) {
+  return {starting:'启动中', running:'运行中', finished:'已完成', failed:'失败', killed:'已停止'}[s] || s;
+}
+function escapeHtml(s) {
+  return String(s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+}
+
+// ---------- 表单 ----------
+$('platform').onchange = () => {
+  const p = $('platform').value;
+  $('modeRow').style.display = p === 'bili' ? '' : 'none';
+};
+
+$('startBtn').onclick = async () => {
+  const platform = $('platform').value;
+  const keyword = $('keyword').value.trim();
+  const pages = parseInt($('pages').value, 10) || 3;
+  const mode = $('mode').value;
+  if (!keyword) { alert('请输入关键词'); return; }
+  $('startBtn').disabled = true;
+  $('startBtn').textContent = '⏳ 启动中...';
+  try {
+    const task = await api('/api/crawl', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({platform, keyword, pages, mode}),
+    });
+    await refreshTasks();
+    subscribe(task.id);
+  } catch (e) {
+    alert('启动失败: ' + e.message);
+  } finally {
+    $('startBtn').disabled = false;
+    $('startBtn').textContent = '▶ 开始爬取';
+  }
+};
+
+// 回车提交
+$('keyword').onkeydown = e => { if (e.key === 'Enter') $('startBtn').click(); };
+
+// 清空终端
+$('clearTerm').onclick = () => {
+  $('termBody').innerHTML = '';
+};
+
+// 自动滚动开关
+$('autoScrollBtn').onclick = () => {
+  autoScroll = !autoScroll;
+  $('autoScrollBtn').textContent = '自动滚动: ' + (autoScroll ? '开' : '关');
+};
+
+// ---------- 心跳 ----------
+async function health() {
+  try {
+    await api('/api/health');
+    $('healthDot').style.background = 'var(--green)';
+    $('healthText').textContent = '服务在线';
+  } catch (e) {
+    $('healthDot').style.background = 'var(--red)';
+    $('healthText').textContent = '服务离线';
+  }
+}
+
+// 轮询任务列表（运行中 1s，否则 3s）
+setInterval(() => {
+  health();
+  const running = Object.values(tasksMap).some(t => t.status === 'running' || t.status === 'starting');
+  refreshTasks();
+}, running ? 1000 : 3000);
+
+// 启动
+health();
+refreshTasks();
+</script>
+</body>
+</html>
