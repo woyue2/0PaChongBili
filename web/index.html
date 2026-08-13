@@ -507,7 +507,7 @@
       </div>
       <div class="form-row">
         <label>截至日期</label>
-        <select id="rAsOfDate" title="只使用该日及之前采集的数据">
+        <select id="rAsOfDate" title="使用所选日期当天及之前采集的数据">
           <option value="">最新数据</option>
         </select>
       </div>
@@ -931,22 +931,31 @@ async function loadResultKeywords(platform) {
   }
 }
 
-async function loadResultDates() {
+async function loadResultDates(retry = true) {
   const platform = $('rPlatform').value;
   const keyword = $('rKeyword').value;
   const sel = $('rAsOfDate');
+  const requestKey = `${platform}\n${keyword}`;
+  sel.dataset.requestKey = requestKey;
   sel.innerHTML = '<option value="">最新数据</option>';
   if (!keyword) return;
   try {
     const data = await api(`/api/result-dates/${platform}?keyword=${encodeURIComponent(keyword)}`);
+    if (sel.dataset.requestKey !== requestKey) return;
     for (const snapshotDate of data.dates || []) {
       const opt = document.createElement('option');
       opt.value = snapshotDate;
-      opt.textContent = `截至 ${snapshotDate}`;
+      opt.textContent = `截至 ${snapshotDate}（含当日）`;
       sel.appendChild(opt);
     }
   } catch (e) {
-    sel.innerHTML = '<option value="">日期加载失败</option>';
+    if (sel.dataset.requestKey !== requestKey) return;
+    if (retry) {
+      await new Promise(resolve => setTimeout(resolve, 300));
+      if (sel.dataset.requestKey === requestKey) await loadResultDates(false);
+    } else {
+      sel.innerHTML = '<option value="">最新数据（历史日期暂不可用）</option>';
+    }
   }
 }
 
