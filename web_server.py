@@ -22,6 +22,7 @@ import sys
 import threading
 import time
 import uuid
+from datetime import date
 from collections import deque
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
@@ -71,6 +72,10 @@ def build_command(platform, keyword, pages, mode):
 
 def task_runner(task):
     """后台线程：启动子进程，逐行读取 print 输出写入任务日志。"""
+    with TASKS_LOCK:
+        if task["status"] == "killed":
+            task["finished_at"] = time.time()
+            return
     env = dict(os.environ)
     env["PYTHONIOENCODING"] = "utf-8"  # 保证子进程 stdout 是 UTF-8
     env["PYTHONUNBUFFERED"] = "1"
@@ -96,8 +101,11 @@ def task_runner(task):
 
     with TASKS_LOCK:
         task["proc"] = proc
-        task["status"] = "running"
         task["pid"] = proc.pid
+        if task["status"] == "killed":
+            proc.terminate()
+        else:
+            task["status"] = "running"
 
     try:
         for line in proc.stdout:
@@ -225,6 +233,8 @@ class Handler(BaseHTTPRequestHandler):
                 self._send_json({"error": "not found"}, 404)
         elif path.startswith("/api/results/"):
             self._handle_results(path)
+        elif path.startswith("/api/result-dates/"):
+            self._handle_result_dates(path)
         elif path.startswith("/api/snapshots/"):
             self._handle_snapshots(path)
         else:
@@ -273,6 +283,42 @@ class Handler(BaseHTTPRequestHandler):
             web_preferences.set_hidden(platform, video_id, record_date, hidden)
             self._send_json({"ok": True, "hidden": hidden})
 
+        elif path == "/api/results/note":
+            body = self._read_json()
+            platform = body.get("platform")
+            record_id = body.get("record_id")
+            content = body.get("content")
+            if platform not in PLATFORMS or record_id is None or content is None:
+                self._send_json({"error": "platform/record_id/content 参数无效"}, 400)
+                return
+            try:
+                note = web_preferences.save_record_note(platform, record_id, content)
+            except ValueError as e:
+                self._send_json({"error": str(e)}, 400)
+            except Exception as e:
+                self._send_json({"error": f"保存笔记失败: {e}"}, 500)
+            else:
+                self._send_json({
+                    "ok": True, "platform": platform, "record_id": str(record_id), **note
+                })
+
+        elif path == "/api/results/delete":
+            body = self._read_json()
+            platform = body.get("platform")
+            record_id = body.get("record_id")
+            if platform not in PLATFORMS or record_id is None or not str(record_id).strip():
+                self._send_json({"error": "platform/record_id 参数无效"}, 400)
+                return
+            try:
+                web_queries.delete_record(platform, record_id)
+                web_preferences.delete_record_note(platform, record_id)
+            except ValueError as e:
+                self._send_json({"error": str(e)}, 404)
+            except Exception as e:
+                self._send_json({"error": f"删除失败: {e}"}, 500)
+            else:
+                self._send_json({"ok": True, "record_id": str(record_id)})
+
         elif path.startswith("/api/tasks/") and path.endswith("/kill"):
             parts = path.strip("/").split("/")
             # /api/tasks/<id>/kill
@@ -292,7 +338,9 @@ class Handler(BaseHTTPRequestHandler):
                 except Exception as e:
                     self._send_json({"error": str(e)}, 500)
                     return
+            with TASKS_LOCK:
                 task["status"] = "killed"
+                task["finished_at"] = time.time()
             self._send_json(task_to_dict(task))
 
         else:
@@ -320,30 +368,80 @@ class Handler(BaseHTTPRequestHandler):
         qs = parse_qs(urlparse(self.path).query)
         keyword = (qs.get("keyword") or [""])[0].strip()
         analysis = (qs.get("analysis") or ["momentum"])[0]
+        as_of_date = (qs.get("as_of_date") or [""])[0].strip()
+        try:
+            page = int((qs.get("page") or ["1"])[0])
+        except (TypeError, ValueError):
+            self._send_json({"error": "page 必须是正整数"}, 400)
+            return
         if platform not in PLATFORMS:
             self._send_json({"error": f"未知平台: {platform}"}, 400)
             return
         if not keyword:
             self._send_json({"error": "缺少 keyword 参数"}, 400)
             return
+        if page < 1:
+            self._send_json({"error": "page 必须是正整数"}, 400)
+            return
+        if as_of_date:
+            try:
+                date.fromisoformat(as_of_date)
+            except ValueError:
+                self._send_json({"error": "as_of_date 必须是 YYYY-MM-DD"}, 400)
+                return
         if analysis not in ("momentum", "value"):
             self._send_json({"error": "analysis 仅支持 momentum 或 value"}, 400)
             return
         if analysis == "value" and platform == "kuaishou":
             self._send_json({"error": "快手暂不支持 value 分析"}, 400)
             return
-        items = web_queries.get_ranking(platform, keyword, analysis)
+        page_size = 99
+        all_items = web_queries.get_ranking(
+            platform, keyword, analysis, limit=None, as_of_date=as_of_date or None
+        )
+        total = len(all_items)
+        total_pages = (total + page_size - 1) // page_size
+        if total_pages and page > total_pages:
+            page = total_pages
+        start = (page - 1) * page_size
+        items = all_items[start:start + page_size]
         hidden = web_preferences.list_hidden_days(platform, [item.get("id") for item in items])
+        notes = web_preferences.list_record_notes(platform, [item.get("id") for item in items])
         for item in items:
-            item["hidden_history_days"] = hidden.get(str(item.get("id")), [])
+            record_id = str(item.get("id"))
+            item["hidden_history_days"] = hidden.get(record_id, [])
+            item["note"] = notes.get(record_id, {}).get("content", "")
+            item["note_updated_at"] = notes.get(record_id, {}).get("updated_at")
         self._send_json({
             "platform": platform,
             "platform_name": PLATFORMS[platform]["name"],
             "keyword": keyword,
             "analysis": analysis,
+            "as_of_date": as_of_date or None,
             "value_supported": platform in ("bili", "xhs", "douyin"),
             "count": len(items),
+            "total": total,
+            "page": page,
+            "page_size": page_size,
+            "total_pages": total_pages,
             "items": items,
+        })
+
+    def _handle_result_dates(self, path):
+        """GET /api/result-dates/<platform>?keyword= → 有实际快照的日期。"""
+        parts = path.strip("/").split("/")
+        platform = parts[2] if len(parts) == 3 else ""
+        keyword = (parse_qs(urlparse(self.path).query).get("keyword") or [""])[0].strip()
+        if platform not in PLATFORMS:
+            self._send_json({"error": f"未知平台: {platform}"}, 400)
+            return
+        if not keyword:
+            self._send_json({"error": "缺少 keyword 参数"}, 400)
+            return
+        self._send_json({
+            "platform": platform,
+            "keyword": keyword,
+            "dates": web_queries.list_ranking_dates(platform, keyword),
         })
 
     def _handle_snapshots(self, path):

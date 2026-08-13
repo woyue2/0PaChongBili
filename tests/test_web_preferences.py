@@ -34,6 +34,30 @@ class WebPreferencesTests(unittest.TestCase):
         self.assertEqual(web_preferences.list_hidden_days("bili", ["same"]), {"same": []})
         self.assertEqual(web_preferences.list_hidden_days("xhs", ["other"]), {"other": []})
 
+    def test_record_note_persists_and_updates(self):
+        saved = web_preferences.save_record_note("xhs", "same", "第一版")
+        self.assertEqual(saved["content"], "第一版")
+        web_preferences.save_record_note("xhs", "same", "第二版")
+        self.assertEqual(
+            web_preferences.list_record_notes("xhs", ["same"])["same"]["content"],
+            "第二版",
+        )
+
+    def test_record_notes_are_scoped_and_empty_content_clears(self):
+        web_preferences.save_record_note("xhs", "same", "小红书笔记")
+        web_preferences.save_record_note("bili", "same", "B站笔记")
+        notes = web_preferences.list_record_notes("xhs", ["same"])
+        self.assertEqual(notes["same"]["content"], "小红书笔记")
+        self.assertEqual(web_preferences.list_record_notes("bili", ["same"])["same"]["content"], "B站笔记")
+        web_preferences.save_record_note("xhs", "same", "")
+        self.assertEqual(web_preferences.list_record_notes("xhs", ["same"]), {})
+
+    def test_record_note_length_is_limited(self):
+        with self.assertRaises(ValueError):
+            web_preferences.save_record_note("xhs", "same", "x" * 10001)
+        with self.assertRaises(ValueError):
+            web_preferences.save_record_note("xhs", "same", {"text": "无效"})
+
 
 if __name__ == "__main__":
     unittest.main()

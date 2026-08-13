@@ -13,6 +13,7 @@ web_queries.py - Web 控制台只读查询层（零第三方依赖）
 import os
 import sqlite3
 import threading
+from datetime import date, timedelta
 
 from src.common import paths
 
@@ -189,7 +190,30 @@ def list_snapshots(platform, keyword, min_videos=1):
     return result
 
 
-def get_ranking(platform, keyword, analysis="momentum", limit=100):
+def list_ranking_dates(platform, keyword):
+    """Return dates that actually contain history rows for this keyword."""
+    if platform not in _PLATFORM_DB or not keyword:
+        return []
+    conn = _connect(platform)
+    if conn is None or not _task_table_exists(conn):
+        return []
+    schema = _SCHEMA[platform]
+    try:
+        rows = conn.execute(f"""
+            SELECT DISTINCT date(h.record_time) AS snapshot_date
+            FROM {schema['history_table']} h
+            JOIN spider_tasks t ON t.id = h.task_id
+            WHERE t.keyword = ? AND h.record_time IS NOT NULL
+            ORDER BY snapshot_date DESC
+        """, (keyword,)).fetchall()
+        return [row[0] for row in rows if row[0]]
+    except sqlite3.Error:
+        return []
+    finally:
+        conn.close()
+
+
+def get_ranking(platform, keyword, analysis="momentum", limit=100, as_of_date=None):
     """
     最新排行。复用各平台 util 的评分方法，统一输出字段：
       {id, title, author, metric_value, score, growth_pct, data_points, url, raw}
@@ -202,6 +226,12 @@ def get_ranking(platform, keyword, analysis="momentum", limit=100):
     conn = _connect(platform)
     if conn is None:
         return []
+    if as_of_date:
+        try:
+            conn = _as_of_snapshot(conn, platform, as_of_date)
+        except (TypeError, ValueError, sqlite3.Error):
+            conn.close()
+            return []
     db = None
     try:
         if platform == "bili":
@@ -276,6 +306,132 @@ def get_ranking(platform, keyword, analysis="momentum", limit=100):
                 pass
 
     return [_normalize_item(platform, i) for i in items]
+
+
+def _as_of_snapshot(source, platform, as_of_date):
+    """Return an in-memory DB whose counters stop at the end of ``as_of_date``."""
+    day = date.fromisoformat(as_of_date)
+    cutoff = (day + timedelta(days=1)).isoformat()
+    memory = sqlite3.connect(":memory:")
+    memory.row_factory = sqlite3.Row
+    source.backup(memory)
+    source.close()
+
+    schema = _SCHEMA[platform]
+    id_col = schema["id_col"]
+    main_table = schema["main_table"]
+    history_table = schema["history_table"]
+    history_columns = {row[1] for row in memory.execute(f"PRAGMA table_info({history_table})")}
+    main_columns = {row[1] for row in memory.execute(f"PRAGMA table_info({main_table})")}
+    memory.execute(f"DELETE FROM {history_table} WHERE record_time >= ?", (cutoff,))
+    memory.execute(
+        f"DELETE FROM {main_table} WHERE NOT EXISTS ("
+        f"SELECT 1 FROM {history_table} h WHERE h.{id_col} = {main_table}.{id_col})"
+    )
+
+    # task relation tables are used by XHS/Kuaishou ranking queries. Remove videos
+    # that have no snapshot at or before the selected day, so future discoveries
+    # cannot leak into a historical ranking.
+    relation = {"xhs": ("task_notes", "note_id"), "kuaishou": ("task_videos", "video_id")}.get(platform)
+    if relation:
+        relation_table, relation_id = relation
+        memory.execute(
+            f"DELETE FROM {relation_table} WHERE task_id IN ("
+            "SELECT id FROM spider_tasks WHERE created_at >= ?)", (cutoff,)
+        )
+        memory.execute(
+            f"DELETE FROM {relation_table} WHERE NOT EXISTS ("
+            f"SELECT 1 FROM {history_table} h WHERE h.{id_col} = {relation_table}.{relation_id})"
+        )
+
+    metric_map = {
+        "bili": ["play_nums", "danmakus", "favorites", "review", "coin", "share", "like_count"],
+        "xhs": ["interact_count", "liked_count", "collected_count", "comment_count", "share_count"],
+        "douyin": ["play_count", "liked_count", "comment_count", "share_count"],
+        "kuaishou": ["play_count", "liked_count", "comment_count", "share_count"],
+    }[platform]
+    for column in metric_map:
+        if column not in history_columns or column not in main_columns:
+            continue
+        memory.execute(f"""
+            UPDATE {main_table} AS m SET {column} = COALESCE((
+                SELECT h.{column} FROM {history_table} h
+                WHERE h.{id_col} = m.{id_col}
+                ORDER BY h.record_time DESC, h.id DESC LIMIT 1
+            ), 0)
+        """)
+
+    # Rebuild rate fields solely from retained snapshots. This prevents a rate
+    # calculated during a later crawl from influencing the historical score.
+    primary = schema["metric_col"]
+    velocity_col = "play_velocity" if platform in ("bili", "kuaishou") else "interact_velocity"
+    if velocity_col in main_columns:
+        memory.execute(f"""
+            UPDATE {main_table} AS m SET {velocity_col} = COALESCE((
+                SELECT CASE WHEN julianday(MAX(h.record_time)) > julianday(MIN(h.record_time))
+                    THEN (MAX(h.{primary}) - MIN(h.{primary})) /
+                         ((julianday(MAX(h.record_time)) - julianday(MIN(h.record_time))) * 24.0)
+                    ELSE 0 END
+                FROM {history_table} h WHERE h.{id_col} = m.{id_col}
+            ), 0)
+        """)
+    if platform == "bili" and "engagement_score" in main_columns:
+        memory.execute(f"""
+            UPDATE {main_table} SET engagement_score =
+                (COALESCE(like_count, 0) + COALESCE(coin, 0) + COALESCE(favorites, 0) +
+                 COALESCE(review, 0) + COALESCE(danmakus, 0)) / MAX(COALESCE(play_nums, 0), 1.0)
+        """)
+    if platform == "kuaishou" and "engagement_rate" in main_columns:
+        memory.execute(f"""
+            UPDATE {main_table} SET engagement_rate =
+                (COALESCE(liked_count, 0) + COALESCE(comment_count, 0) + COALESCE(share_count, 0)) /
+                MAX(COALESCE(play_count, 0), 1.0)
+        """)
+    memory.commit()
+    return memory
+
+
+def delete_record(platform, record_id):
+    """删除一个平台记录及其历史采集数据，不删除爬取任务本身。"""
+    if platform not in _PLATFORM_DB or record_id is None or str(record_id).strip() == "":
+        raise ValueError("platform 或 record_id 无效")
+    db_file = _PLATFORM_DB[platform]
+    if not os.path.exists(db_file):
+        raise ValueError("数据文件不存在")
+    schema = _SCHEMA[platform]
+    record_id = str(record_id).strip()
+    conn = sqlite3.connect(db_file)
+    try:
+        conn.execute("PRAGMA foreign_keys = ON")
+        exists = conn.execute(
+            f"SELECT 1 FROM {schema['main_table']} WHERE {schema['id_col']} = ? LIMIT 1",
+            (record_id,),
+        ).fetchone()
+        if not exists:
+            raise ValueError("记录不存在")
+        cleanup_tables = [(schema["history_table"], schema["id_col"])]
+        if platform == "xhs":
+            cleanup_tables += [("task_notes", "note_id"), ("failed_notes", "note_id")]
+        elif platform == "kuaishou":
+            cleanup_tables += [("task_videos", "video_id"), ("failed_videos", "video_id")]
+        elif platform == "bili":
+            cleanup_tables += [("failed_videos", "av_id")]
+        else:
+            cleanup_tables += [("failed_notes", "aweme_id")]
+        for table, column in cleanup_tables:
+            table_exists = conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name = ?", (table,)
+            ).fetchone()
+            if table_exists:
+                conn.execute(f"DELETE FROM {table} WHERE {column} = ?", (record_id,))
+        conn.execute(f"DELETE FROM {schema['main_table']} WHERE {schema['id_col']} = ?", (record_id,))
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+    return True
 
 
 def _readonly_database(database_class, conn):

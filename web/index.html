@@ -148,6 +148,8 @@
   .task-item .t-meta { font-size: 11px; color: var(--muted); margin-bottom: 6px; }
   .task-item .t-progress { height: 3px; background: var(--bg); border-radius: 2px; overflow: hidden; }
   .task-item .t-progress .bar { height: 100%; width: 0; background: var(--accent); transition: width .3s; }
+  .task-item .t-actions { display: flex; justify-content: flex-end; margin-top: 8px; }
+  .task-item .t-kill { padding: 4px 10px; font-size: 12px; }
 
   .status-pill {
     font-size: 11px;
@@ -262,6 +264,11 @@
     grid-template-columns: repeat(auto-fill, minmax(260px, 1fr));
     gap: 14px;
   }
+  .results-pagination { display: flex; justify-content: center; align-items: center; gap: 6px; margin: 20px 0 28px; flex-wrap: wrap; }
+  .results-pagination button { min-width: 34px; padding: 6px 10px; }
+  .results-pagination button.active { background: var(--accent); color: #fff; border-color: var(--accent); }
+  .results-pagination button:disabled { opacity: .45; cursor: default; }
+  .results-pagination .ellipsis { color: var(--muted); padding: 0 3px; }
   .video-card {
     background: var(--panel);
     border: 1px solid var(--border);
@@ -309,6 +316,16 @@
   .vc-tag { font-size: 11px; padding: 1px 8px; border-radius: 8px; background: var(--bg); border: 1px solid var(--border); color: var(--muted); }
   .vc-link { font-size: 12px; color: var(--accent); text-decoration: none; }
   .vc-link:hover { text-decoration: underline; }
+  .vc-delete { align-self: flex-start; border-color: rgba(248,81,73,.45); color: var(--red); font-size: 12px; padding: 5px 10px; }
+  .vc-delete:hover { background: rgba(248,81,73,.12); border-color: var(--red); }
+  .vc-card-actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 2px; }
+  .vc-note.has-note { color: var(--green); border-color: rgba(63,185,80,.5); }
+  .note-modal-backdrop { position: fixed; inset: 0; z-index: 20; display: flex; align-items: center; justify-content: center; padding: 20px; background: rgba(0,0,0,.65); }
+  .note-modal { width: min(560px, 100%); background: var(--panel); border: 1px solid var(--border); border-radius: 10px; padding: 18px; box-shadow: 0 12px 40px rgba(0,0,0,.45); }
+  .note-modal h3 { margin-bottom: 12px; font-size: 16px; }
+  .note-modal textarea { width: 100%; min-height: 180px; resize: vertical; padding: 10px; background: var(--bg); color: var(--text); border: 1px solid var(--border); border-radius: 6px; font: inherit; line-height: 1.5; }
+  .note-modal textarea:focus { outline: none; border-color: var(--accent); }
+  .note-modal-foot { display: flex; justify-content: flex-end; gap: 8px; margin-top: 12px; }
   .vc-detail-tabs { display: flex; gap: 16px; border-bottom: 1px solid var(--border); margin-top: 4px; }
   .vc-detail-tab { border: 0; border-radius: 0; padding: 7px 0; background: transparent; color: var(--muted); font-size: 12px; border-bottom: 2px solid transparent; }
   .vc-detail-tab:hover { background: transparent; color: var(--text); }
@@ -488,6 +505,12 @@
           <option value="value">价值</option>
         </select>
       </div>
+      <div class="form-row">
+        <label>截至日期</label>
+        <select id="rAsOfDate" title="只使用该日及之前采集的数据">
+          <option value="">最新数据</option>
+        </select>
+      </div>
       <button id="rLoadBtn">加载排行</button>
     </div>
     <div id="resultsContent"><div class="empty">选择平台和关键词后点击"加载排行"</div></div>
@@ -538,6 +561,35 @@ async function api(url, opts = {}) {
   const data = await res.json().catch(() => ({}));
   if (!res.ok) throw new Error(data.error || `HTTP ${res.status}`);
   return data;
+}
+
+function openNoteModal(button) {
+  const backdrop = document.createElement('div');
+  backdrop.className = 'note-modal-backdrop';
+  backdrop.innerHTML = `<div class="note-modal" role="dialog" aria-modal="true">
+    <h3>记录笔记</h3><textarea maxlength="10000" placeholder="写下你的备注"></textarea>
+    <div class="note-modal-foot"><button type="button" class="note-cancel">取消</button><button type="button" class="note-save">保存</button></div>
+  </div>`;
+  document.body.appendChild(backdrop);
+  const textarea = backdrop.querySelector('textarea');
+  textarea.value = button.dataset.note || '';
+  textarea.focus();
+  const close = () => backdrop.remove();
+  backdrop.querySelector('.note-cancel').onclick = close;
+  backdrop.onclick = event => { if (event.target === backdrop) close(); };
+  backdrop.querySelector('.note-save').onclick = async () => {
+    const saveButton = backdrop.querySelector('.note-save');
+    saveButton.disabled = true;
+    try {
+      const data = await api('/api/results/note', {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({
+        platform: button.dataset.platform, record_id: button.dataset.recordId, content: textarea.value
+      })});
+      button.dataset.note = data.content || '';
+      button.textContent = data.content ? '笔记 · 已有' : '笔记';
+      button.classList.toggle('has-note', !!data.content);
+      close();
+    } catch (error) { alert('保存笔记失败: ' + error.message); saveButton.disabled = false; }
+  };
 }
 
 function fmtTime(ts) {
@@ -636,8 +688,25 @@ async function refreshTasks() {
         </div>
         <div class="t-meta">页数: ${t.pages} · ${t.mode || '-'} · ${fmtTime(t.created_at)} · ${t.line_count} 行</div>
         ${isRunning ? '<div class="t-progress"><div class="bar" style="animation: pulse 1.2s infinite;"></div></div>' : ''}
+        ${isRunning ? '<div class="t-actions"><button class="danger t-kill" type="button">■ 终止任务</button></div>' : ''}
       `;
       item.onclick = () => { subscribe(t.id); refreshTasks(); };
+      const killButton = item.querySelector('.t-kill');
+      if (killButton) killButton.onclick = async event => {
+        event.stopPropagation();
+        if (!confirm(`确定终止 [${t.platform_name}] ${t.keyword}？`)) return;
+        killButton.disabled = true;
+        killButton.textContent = '终止中...';
+        try {
+          await api(`/api/tasks/${t.id}/kill`, {method: 'POST'});
+          if (t.id === currentTaskId) termStatus('[已请求终止任务]');
+          await refreshTasks();
+        } catch (error) {
+          alert('终止失败: ' + error.message);
+          killButton.disabled = false;
+          killButton.textContent = '■ 终止任务';
+        }
+      };
       list.appendChild(item);
     });
   } catch (e) {
@@ -739,6 +808,21 @@ function initResultCardDetails(container) {
         await loadResults();
       } catch (error) { alert('保存显示设置失败: ' + error.message); button.disabled = false; }
     });
+    const deleteButton = card.querySelector('.vc-delete');
+    if (deleteButton) deleteButton.onclick = async e => {
+      e.stopPropagation();
+      const title = deleteButton.dataset.title || '这条记录';
+      if (!confirm(`确定要删除“${title}”吗？\n该记录及其历史采集数据都会被删除，且无法恢复。`)) return;
+      deleteButton.disabled = true;
+      try {
+        await api('/api/results/delete', {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({
+          platform: deleteButton.dataset.platform, record_id: deleteButton.dataset.recordId
+        })});
+        await loadResults();
+      } catch (error) { alert('删除失败: ' + error.message); deleteButton.disabled = false; }
+    };
+    const noteButton = card.querySelector('.vc-note');
+    if (noteButton) noteButton.onclick = e => { e.stopPropagation(); openNoteModal(noteButton); };
     const track = card.querySelector('.vc-history-track');
     if (!track) return;
     let dragging = false, startX = 0, startScroll = 0;
@@ -800,8 +884,9 @@ async function loadOverview() {
       const keyword = card.dataset.keyword;
       card.querySelector('.ov-results').onclick = () => {
         $('rPlatform').value = platform;
-        loadResultKeywords(platform).then(() => {
+        loadResultKeywords(platform).then(async () => {
           $('rKeyword').value = keyword;
+          await loadResultDates();
           loadResults();
           switchView('results');
         });
@@ -830,6 +915,7 @@ async function loadResultKeywords(platform) {
     sel.innerHTML = '';
     if (!info.keywords.length) {
       sel.innerHTML = '<option value="">无数据</option>';
+      $('rAsOfDate').innerHTML = '<option value="">无可用日期</option>';
       return;
     }
     for (const kw of info.keywords) {
@@ -838,28 +924,58 @@ async function loadResultKeywords(platform) {
       opt.textContent = `${kw.keyword} (${kw.task_count}任务)`;
       sel.appendChild(opt);
     }
+    await loadResultDates();
   } catch (e) {
     $('rKeyword').innerHTML = `<option value="">加载失败</option>`;
+    $('rAsOfDate').innerHTML = '<option value="">加载失败</option>';
   }
 }
 
-async function loadResults() {
+async function loadResultDates() {
+  const platform = $('rPlatform').value;
+  const keyword = $('rKeyword').value;
+  const sel = $('rAsOfDate');
+  sel.innerHTML = '<option value="">最新数据</option>';
+  if (!keyword) return;
+  try {
+    const data = await api(`/api/result-dates/${platform}?keyword=${encodeURIComponent(keyword)}`);
+    for (const snapshotDate of data.dates || []) {
+      const opt = document.createElement('option');
+      opt.value = snapshotDate;
+      opt.textContent = `截至 ${snapshotDate}`;
+      sel.appendChild(opt);
+    }
+  } catch (e) {
+    sel.innerHTML = '<option value="">日期加载失败</option>';
+  }
+}
+
+function paginationPages(current, total) {
+  if (total <= 7) return Array.from({length: total}, (_, i) => i + 1);
+  const pages = new Set([1, total, current - 1, current, current + 1]);
+  return [...pages].filter(p => p >= 1 && p <= total).sort((a, b) => a - b);
+}
+
+async function loadResults(page = 1) {
   const el = $('resultsContent');
   el.innerHTML = '<div class="empty">加载中...</div>';
   const platform = $('rPlatform').value;
   const keyword = $('rKeyword').value;
   const analysis = $('rAnalysis').value;
+  const asOfDate = $('rAsOfDate').value;
   if (!keyword) { el.innerHTML = '<div class="empty">请选择关键词</div>'; return; }
   try {
-    const data = await api(`/api/results/${platform}?keyword=${encodeURIComponent(keyword)}&analysis=${analysis}`);
+    const dateQuery = asOfDate ? `&as_of_date=${encodeURIComponent(asOfDate)}` : '';
+    const data = await api(`/api/results/${platform}?keyword=${encodeURIComponent(keyword)}&analysis=${analysis}&page=${page}${dateQuery}`);
     if (!data.items.length) {
       el.innerHTML = '<div class="empty">该关键词暂无排行数据</div>';
       return;
     }
-    let html = `<div style="margin:8px 0 14px;color:var(--muted);font-size:13px;">${escapeHtml(data.platform_name)} · ${escapeHtml(keyword)} · ${analysis === 'value' ? '价值分析' : '动量分析'} · 共 ${data.count} 条</div>`;
+    const dateLabel = data.as_of_date ? ` · 截至 ${escapeHtml(data.as_of_date)}` : ' · 最新数据';
+    let html = `<div style="margin:8px 0 14px;color:var(--muted);font-size:13px;">${escapeHtml(data.platform_name)} · ${escapeHtml(keyword)} · ${analysis === 'value' ? '价值分析' : '动量分析'}${dateLabel} · 共 ${data.total} 条 · 第 ${data.page}/${data.total_pages} 页</div>`;
     html += '<div class="card-grid">';
     data.items.forEach((it, i) => {
-      const rank = i + 1;
+      const rank = (data.page - 1) * data.page_size + i + 1;
       const growth = it.growth_pct;
       const growthHtml = growth === null || growth === undefined
         ? '<span class="vc-growth none">首次采集</span>'
@@ -895,18 +1011,39 @@ async function loadResults() {
           <div class="vc-detail-panel hidden" data-panel="algorithm">${renderAlgorithm(it.algorithm)}</div>
           ${it.tags ? `<div class="vc-tags">${it.tags.split(',').slice(0,3).map(t => `<span class="vc-tag">${escapeHtml(t)}</span>`).join('')}</div>` : ''}
           ${url}
+          <div class="vc-card-actions">
+            <button class="vc-note ${it.note ? 'has-note' : ''}" data-platform="${escapeHtml(platform)}" data-record-id="${escapeHtml(it.id)}" data-note="${escapeHtml(it.note || '')}">${it.note ? '笔记 · 已有' : '笔记'}</button>
+            <button class="vc-delete" data-platform="${escapeHtml(platform)}" data-record-id="${escapeHtml(it.id)}" data-title="${escapeHtml(it.title || it.id)}">删除记录</button>
+          </div>
         </div>`;
     });
     html += '</div>';
+    if (data.total_pages > 1) {
+      const pages = paginationPages(data.page, data.total_pages);
+      let previous = 0;
+      html += '<div class="results-pagination">';
+      html += `<button class="results-page-btn" data-page="${data.page - 1}" ${data.page <= 1 ? 'disabled' : ''}>上一页</button>`;
+      for (const p of pages) {
+        if (previous && p - previous > 1) html += '<span class="ellipsis">…</span>';
+        html += `<button class="results-page-btn ${p === data.page ? 'active' : ''}" data-page="${p}" ${p === data.page ? 'disabled' : ''}>${p}</button>`;
+        previous = p;
+      }
+      html += `<button class="results-page-btn" data-page="${data.page + 1}" ${data.page >= data.total_pages ? 'disabled' : ''}>下一页</button>`;
+      html += '</div>';
+    }
     el.innerHTML = html;
     initResultCardDetails(el);
+    el.querySelectorAll('.results-page-btn:not(:disabled)').forEach(button => {
+      button.onclick = () => loadResults(Number(button.dataset.page));
+    });
   } catch (e) {
     el.innerHTML = `<div class="empty">加载失败: ${escapeHtml(e.message)}</div>`;
   }
 }
 
 $('rPlatform').onchange = () => loadResultKeywords();
-$('rLoadBtn').onclick = loadResults;
+$('rKeyword').onchange = () => loadResultDates();
+$('rLoadBtn').onclick = () => loadResults(1);
 
 // ---------- 对比页 ----------
 async function loadCompareKeywords(platform) {
