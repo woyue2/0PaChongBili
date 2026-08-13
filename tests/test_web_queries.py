@@ -349,8 +349,8 @@ class WebQueriesRankingTests(unittest.TestCase):
         self.assertEqual(items[0]["metric_value"], 888)
         self.assertEqual(len(items[0]["history"]), 1)
 
-    def test_kuaishou_value_unsupported(self):
-        self.assertEqual(wq.get_ranking("kuaishou", "x", "value"), [])
+    def test_kuaishou_value_supported(self):
+        self.assertIsInstance(wq.get_ranking("kuaishou", "x", "value"), list)
 
 
 if __name__ == "__main__":

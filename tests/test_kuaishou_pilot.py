@@ -66,6 +66,15 @@ class KuaishouParserTests(unittest.TestCase):
         payload = KuaishouSpider._extract_search_payload(body)
         self.assertEqual(payload["feeds"][0]["photo"]["id"], "video-2")
 
+    def test_accepts_new_rest_search_feed_shape(self):
+        body = {
+            "result": 1,
+            "pcursor": "no_more",
+            "feeds": [{"photo": {"id": "video-rest"}}],
+        }
+        payload = KuaishouSpider._extract_search_payload(body)
+        self.assertEqual(payload["feeds"][0]["photo"]["id"], "video-rest")
+
     def test_human_readable_number_parser(self):
         self.assertEqual(_as_int("2.5万"), 25_000)
         self.assertEqual(_as_int("1.2亿"), 120_000_000)

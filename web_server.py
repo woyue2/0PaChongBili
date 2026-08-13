@@ -42,7 +42,7 @@ PLATFORMS = {
     },
     "xhs": {"name": "小红书", "modes": ["both"], "default_mode": "both"},
     "douyin": {"name": "抖音", "modes": ["both"], "default_mode": "both"},
-    "kuaishou": {"name": "快手", "modes": [""], "default_mode": ""},
+    "kuaishou": {"name": "快手", "modes": ["both"], "default_mode": "both"},
 }
 
 # 任务存储: task_id -> dict
@@ -392,9 +392,6 @@ class Handler(BaseHTTPRequestHandler):
         if analysis not in ("momentum", "value"):
             self._send_json({"error": "analysis 仅支持 momentum 或 value"}, 400)
             return
-        if analysis == "value" and platform == "kuaishou":
-            self._send_json({"error": "快手暂不支持 value 分析"}, 400)
-            return
         page_size = 99
         all_items = web_queries.get_ranking(
             platform, keyword, analysis, limit=None, as_of_date=as_of_date or None
@@ -418,7 +415,7 @@ class Handler(BaseHTTPRequestHandler):
             "keyword": keyword,
             "analysis": analysis,
             "as_of_date": as_of_date or None,
-            "value_supported": platform in ("bili", "xhs", "douyin"),
+            "value_supported": platform in ("bili", "xhs", "douyin", "kuaishou"),
             "count": len(items),
             "total": total,
             "page": page,

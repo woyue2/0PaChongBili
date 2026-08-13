@@ -61,8 +61,8 @@ _SCHEMA = {
     },
 }
 
-# 哪些平台支持价值分析（kuaishou 无 value 评分）
-_VALUE_SUPPORTED = ("bili", "xhs", "douyin")
+# 各平台都支持基于已抓取互动指标的价值分析。
+_VALUE_SUPPORTED = ("bili", "xhs", "douyin", "kuaishou")
 
 _HISTORY_METRICS = {
     "bili": [("play_nums", "播放"), ("like_count", "点赞"), ("favorites", "收藏"),
@@ -92,6 +92,8 @@ _ALGORITHM_FACTORS = {
                           ("comment_score", "评论率", .20), ("interact_score", "综合互动率", .20)],
     ("kuaishou", "momentum"): [("velocity_score", "播放速率", .40), ("play_score", "播放规模", .25),
                                ("engagement_score", "互动率", .20), ("freshness_score", "新鲜度", .15)],
+    ("kuaishou", "value"): [("like_score", "点赞率", .35), ("comment_score", "评论率", .25),
+                              ("share_score", "分享率", .20), ("interaction_score", "互动率", .20)],
 }
 
 
@@ -260,7 +262,9 @@ def get_ranking(platform, keyword, analysis="momentum", limit=100, as_of_date=No
             from src.kuaishou import kuaishou_util
             conn.row_factory = sqlite3.Row
             db = _readonly_database(kuaishou_util.Database, conn)
-            items = db.get_keyword_momentum_ranking(keyword, limit)
+            items = (db.get_value_ranking(keyword, limit)
+                     if analysis == "value" else
+                     db.get_keyword_momentum_ranking(keyword, limit))
         else:
             return []
         _attach_first_seen(conn, platform, items)
@@ -289,7 +293,9 @@ def get_ranking(platform, keyword, analysis="momentum", limit=100, as_of_date=No
                 items = (db.get_value_ranking(keyword, limit) if analysis == "value"
                          else db.get_keyword_momentum_ranking(keyword, limit))
             else:
-                items = db.get_keyword_momentum_ranking(keyword, limit)
+                items = (db.get_value_ranking(keyword, limit)
+                         if analysis == "value" else
+                         db.get_keyword_momentum_ranking(keyword, limit))
             _attach_first_seen(conn, platform, items)
             _attach_urls(conn, platform, items)
             _attach_history(conn, platform, items)
@@ -592,8 +598,8 @@ def _normalize_item(platform, item):
             "title": item.get("title", ""),
             "author": item.get("nickname", ""),
             "author_uid": item.get("author_id", ""),
-            "metric_value": item.get("play_count", 0),
-            "score": item.get("momentum_score", 0),
+            "metric_value": item.get("current_value", item.get("play_count", 0)),
+            "score": item.get("composite_score", item.get("momentum_score", 0)),
             "growth_pct": None,
             "data_points": 1,
             "url": item.get("page_url", ""),

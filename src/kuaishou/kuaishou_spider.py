@@ -120,6 +120,14 @@ class KuaishouSpider:
         data = body.get("data", body)
         if not isinstance(data, dict):
             return {}
+
+        # 2026 年新版 Web 端已从 GraphQL 切换为 REST：
+        # POST /rest/v/search/feed，响应直接把 feeds 放在根节点。
+        if isinstance(data.get("feeds"), list) and (
+            "pcursor" in data or "result" in data
+        ):
+            return data
+
         payload = data.get(cls.SEARCH_OPERATION)
         if isinstance(payload, dict):
             return payload
@@ -163,7 +171,8 @@ class KuaishouSpider:
             body = response.json()
         except Exception:
             return
-        if "/graphql" in response.url:
+        is_search_rest = "/rest/v/search/feed" in response.url
+        if "/graphql" in response.url or is_search_rest:
             with self._api_lock:
                 self._graphql_responses.append(
                     {
@@ -180,7 +189,10 @@ class KuaishouSpider:
             )
 
     def _on_request(self, request):
-        if "kuaishou.com/graphql" not in request.url:
+        if (
+            "kuaishou.com/graphql" not in request.url
+            and "/rest/v/search/feed" not in request.url
+        ):
             return
         try:
             post_data = request.post_data or ""
@@ -190,7 +202,8 @@ class KuaishouSpider:
         with self._api_lock:
             self._graphql_requests.append(
                 {
-                    "operation_name": payload.get("operationName", ""),
+                    "operation_name": payload.get("operationName", "")
+                    or ("restSearchFeed" if "/rest/v/search/feed" in request.url else ""),
                     "variables": payload.get("variables", {}),
                     "captured_at": time.time(),
                 }
@@ -340,13 +353,25 @@ class KuaishouSpider:
             login_button.count() == 1 and login_button.is_visible()
         )
         logged_in = bool(
-            cookies.get("kuaishou.server.web_st") and not login_prompt_visible
+            self._has_login_cookie(cookies) and not login_prompt_visible
         )
         self.log(
             f"[登录检测] "
             f"{'✓ 持久化会话有效' if logged_in else '✗ 登录会话无效'}"
         )
         return logged_in
+
+    @staticmethod
+    def _has_login_cookie(cookies):
+        """快手不同登录流程可能写入不同的 web_st Cookie 名称。"""
+        return any(
+            cookies.get(name)
+            for name in (
+                "kuaishou.server.web_st",
+                "kuaishou.server.webday7_st",
+                "kuaishou.live.web_st",
+            )
+        )
 
     def _save_current_cookies(self):
         cookies = self._context.cookies("https://www.kuaishou.com")
@@ -356,7 +381,7 @@ class KuaishouSpider:
                 "; ".join(f"{item['name']}={item['value']}" for item in cookies)
             )
 
-    def _force_interactive_login(self, timeout_s=180):
+    def _force_interactive_login(self, timeout_s=60):
         # 有头模式下直接复用当前持久化 context。关闭后立即重启同一个
         # Playwright 实例没有必要，还可能让用户误以为启动了临时 profile。
         if getattr(self.args, "headless", False):
@@ -378,7 +403,7 @@ class KuaishouSpider:
                 item["name"]: item["value"]
                 for item in self._context.cookies("https://www.kuaishou.com")
             }
-            if cookies.get("kuaishou.server.web_st"):
+            if self._has_login_cookie(cookies):
                 self._save_current_cookies()
                 self.auth_state.mark_login("kuaishou")
                 self.log("[登录刷新] ✓ 快手登录成功")
@@ -451,8 +476,35 @@ class KuaishouSpider:
         if search_button is None:
             raise RuntimeError("没有找到唯一且可见的快手搜索按钮")
 
+        with self._api_lock:
+            request_count_before = len(self._graphql_requests)
+        url_before = self._page.url
         search_button.click()
-        self.log("[搜索] 已点击搜索按钮")
+
+        def search_was_triggered():
+            if self._page.url != url_before and "search" in self._page.url.lower():
+                return True
+            with self._api_lock:
+                new_requests = self._graphql_requests[request_count_before:]
+            return any(
+                "search" in str(item.get("operation_name", "")).lower()
+                for item in new_requests
+            )
+
+        deadline = time.time() + 3
+        while time.time() < deadline and not search_was_triggered():
+            self._page.wait_for_timeout(200)
+
+        # 页面改版时按钮可能只是视觉元素，回车通常仍能触发表单搜索。
+        if not search_was_triggered():
+            search_input.press("Enter")
+            deadline = time.time() + 3
+            while time.time() < deadline and not search_was_triggered():
+                self._page.wait_for_timeout(200)
+
+        if not search_was_triggered():
+            raise RuntimeError("点击搜索按钮后未检测到搜索请求或搜索页面跳转")
+        self.log("[搜索] 已触发搜索并检测到搜索请求")
 
     def _parse_visible_cards(self):
         """网络结构变化时，从已渲染作品卡片保底提取链接和文本。"""
@@ -531,6 +583,75 @@ class KuaishouSpider:
         self.log(f"[调试] 已保存当前搜索页 HTML: {html_file}")
         return html_file
 
+    def _scroll_search_results(self, seen_ids):
+        """渐进滚动实际结果容器，兼容快手新版内部滚动布局。"""
+        state = self._page.evaluate(
+            """
+            (seenIds) => {
+                const isScrollable = (element) => {
+                    const style = getComputedStyle(element);
+                    return element.scrollHeight > element.clientHeight + 80
+                        && ['auto', 'scroll'].includes(style.overflowY);
+                };
+                const candidates = Array.from(document.querySelectorAll('*'))
+                    .filter(isScrollable)
+                    .map(element => {
+                        const rect = element.getBoundingClientRect();
+                        const links = Array.from(
+                            element.querySelectorAll('a[href*="/short-video/"]')
+                        );
+                        return {element, rect, links};
+                    })
+                    .filter(item => item.rect.width > 300 && item.rect.height > 200)
+                    .sort((a, b) =>
+                        (b.links.length - a.links.length)
+                        || ((b.rect.width * b.rect.height) - (a.rect.width * a.rect.height))
+                    );
+
+                const chosen = candidates.length
+                    ? candidates[0]
+                    : {element: document.scrollingElement || document.documentElement,
+                       rect: (document.scrollingElement || document.documentElement)
+                           .getBoundingClientRect(), links: []};
+                const target = chosen.element;
+                const before = target.scrollTop;
+                const distance = Math.max(target.clientHeight * 0.8, 700);
+                const maxTop = Math.max(0, target.scrollHeight - target.clientHeight);
+                target.scrollTop = Math.min(before + distance, maxTop);
+                target.dispatchEvent(new Event('scroll', {bubbles: true}));
+
+                const rect = target.getBoundingClientRect();
+                return {
+                    container: target.tagName.toLowerCase()
+                        + (target.className && typeof target.className === 'string'
+                            ? '.' + target.className.trim().split(/\\s+/).slice(0, 2).join('.')
+                            : ''),
+                    before: Math.round(before),
+                    top: Math.round(target.scrollTop),
+                    height: Math.round(target.scrollHeight),
+                    viewport: Math.round(target.clientHeight),
+                    cards: chosen.links.length,
+                    unseenCards: chosen.links.filter(link => {
+                        const match = (link.href || '').match(/\\/short-video\\/([^/?#]+)/);
+                        return match && !seenIds.includes(match[1]);
+                    }).length,
+                    mouseX: Math.max(1, Math.round(rect.left + rect.width / 2)),
+                    mouseY: Math.max(1, Math.round(rect.top + rect.height / 2))
+                };
+            }
+            """,
+            list(seen_ids),
+        )
+        self._page.mouse.move(state.get("mouseX", 1), state.get("mouseY", 1))
+        self._page.mouse.wheel(0, 1200)
+        self.log(
+            f"[滚动] 容器={state.get('container', '?')} "
+            f"位置={state.get('before', '?')}->{state.get('top', '?')}/"
+            f"{state.get('height', '?')}，卡片={state.get('cards', '?')}，"
+            f"未见={state.get('unseenCards', '?')}"
+        )
+        return state
+
     def search_videos(self, keyword, pages=1):
         self._ensure_playwright()
         self._clear_search_responses()
@@ -557,18 +678,9 @@ class KuaishouSpider:
             with self._api_lock:
                 start_index = len(self._search_responses)
             try:
-                self._page.evaluate(
-                    """
-                    () => {
-                        const target = document.scrollingElement
-                            || document.documentElement;
-                        target.scrollTop = target.scrollHeight;
-                        window.dispatchEvent(new Event('scroll'));
-                    }
-                    """
-                )
-                self._page.mouse.wheel(0, 1600)
+                scroll_state = self._scroll_search_results(list(all_items))
             except Exception as exc:
+                scroll_state = {}
                 self.log(f"[滚动] 第{page_number}页触发异常: {exc}")
             self._page.wait_for_timeout(int(random.uniform(1800, 2800)))
             new_items = self._wait_for_new_items(
@@ -578,7 +690,9 @@ class KuaishouSpider:
                 all_items[item["video_id"]] = item
             self.log(
                 f"[搜索] 第{page_number}批新增 {len(new_items)} 条，"
-                f"累计 {len(all_items)} 条"
+                f"累计 {len(all_items)} 条，"
+                f"滚动位置={scroll_state.get('top', '?')}/"
+                f"{scroll_state.get('height', '?')}"
             )
             if not new_items:
                 break

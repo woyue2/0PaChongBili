@@ -314,6 +314,63 @@ class Database:
         results.sort(key=lambda item: item["momentum_score"], reverse=True)
         return results[:limit]
 
+    def get_value_ranking(self, keyword, limit=50):
+        """快手价值分析：用播放归一化的深度互动率衡量内容质量。"""
+        rows = self.conn.execute(
+            """
+            SELECT v.*
+            FROM ks_videos v
+            WHERE EXISTS (
+                SELECT 1 FROM task_videos tv JOIN spider_tasks t ON t.id = tv.task_id
+                WHERE tv.video_id = v.video_id AND t.keyword = ?
+            )
+            """,
+            (keyword,),
+        ).fetchall()
+        if not rows:
+            return []
+
+        values = []
+        for row in rows:
+            item = dict(row)
+            plays = max(float(item.get("play_count") or 0), 1.0)
+            liked = float(item.get("liked_count") or 0)
+            comments = float(item.get("comment_count") or 0)
+            shares = float(item.get("share_count") or 0)
+            item["like_rate"] = liked / plays
+            item["comment_rate"] = comments / plays
+            item["share_rate"] = shares / plays
+            item["interaction_rate"] = (liked + comments + shares) / plays
+            values.append(item)
+
+        def normalize(key):
+            low = min(item[key] for item in values)
+            high = max(item[key] for item in values)
+            if high <= low:
+                return {id(item): 0.5 for item in values}
+            return {id(item): (item[key] - low) / (high - low) for item in values}
+
+        like_scores = normalize("like_rate")
+        comment_scores = normalize("comment_rate")
+        share_scores = normalize("share_rate")
+        interaction_scores = normalize("interaction_rate")
+        for item in values:
+            item["like_score"] = round(like_scores[id(item)], 4)
+            item["comment_score"] = round(comment_scores[id(item)], 4)
+            item["share_score"] = round(share_scores[id(item)], 4)
+            item["interaction_score"] = round(interaction_scores[id(item)], 4)
+            item["current_value"] = int(item["liked_count"] or 0) + int(item["comment_count"] or 0) + int(item["share_count"] or 0)
+            item["value_score"] = round(
+                like_scores[id(item)] * 0.35
+                + comment_scores[id(item)] * 0.25
+                + share_scores[id(item)] * 0.20
+                + interaction_scores[id(item)] * 0.20,
+                4,
+            )
+            item["composite_score"] = item["value_score"]
+        values.sort(key=lambda item: item["value_score"], reverse=True)
+        return values[:limit]
+
     def export_momentum_csv(self, keyword, csv_file, results=None):
         results = results or self.get_keyword_momentum_ranking(keyword)
         parent = os.path.dirname(os.path.abspath(csv_file))
