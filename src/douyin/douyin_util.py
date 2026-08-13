@@ -133,12 +133,16 @@ class Database:
                 interact_velocity REAL DEFAULT 0,
                 engagement_score REAL DEFAULT 0,
                 fetched_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                first_seen_at DATETIME DEFAULT CURRENT_TIMESTAMP,
                 FOREIGN KEY (task_id) REFERENCES spider_tasks(id)
             )
         """)
 
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_dy_notes_task_id ON dy_notes(task_id)")
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_dy_notes_aweme_id ON dy_notes(aweme_id)")
+        note_columns = {row[1] for row in cursor.execute("PRAGMA table_info(dy_notes)")}
+        if "first_seen_at" not in note_columns:
+            cursor.execute("ALTER TABLE dy_notes ADD COLUMN first_seen_at DATETIME")
 
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS dy_users (
@@ -181,6 +185,12 @@ class Database:
         """)
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_history_aweme_id ON note_history(aweme_id)")
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_history_time ON note_history(record_time)")
+        cursor.execute("""
+            UPDATE dy_notes SET first_seen_at = COALESCE(
+                (SELECT MIN(record_time) FROM note_history h WHERE h.aweme_id = dy_notes.aweme_id),
+                fetched_at
+            ) WHERE first_seen_at IS NULL
+        """)
 
         self.conn.commit()
 
@@ -383,8 +393,10 @@ class Database:
                    n.interact_velocity, n.note_age_hours, n.engagement_score,
                    n.comment_count, n.liked_count, n.share_count, n.collected_count, n.tags, n.video_url
             FROM dy_notes n
-            JOIN spider_tasks t ON n.task_id = t.id
-            WHERE t.keyword = ?
+            WHERE EXISTS (
+                SELECT 1 FROM note_history h JOIN spider_tasks t ON t.id = h.task_id
+                WHERE h.aweme_id = n.aweme_id AND t.keyword = ?
+            )
         """, (keyword,))
         notes = cursor.fetchall()
 
@@ -512,8 +524,10 @@ class Database:
                    n.note_age_hours, n.engagement_score, n.comment_count,
                    n.liked_count, n.collected_count, n.share_count, n.tags, n.video_url
             FROM dy_notes n
-            JOIN spider_tasks t ON n.task_id = t.id
-            WHERE t.keyword = ?
+            WHERE EXISTS (
+                SELECT 1 FROM note_history h JOIN spider_tasks t ON t.id = h.task_id
+                WHERE h.aweme_id = n.aweme_id AND t.keyword = ?
+            )
         """, (keyword,))
         notes = cursor.fetchall()
 

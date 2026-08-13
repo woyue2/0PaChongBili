@@ -12,6 +12,7 @@ web_queries.py - Web 控制台只读查询层（零第三方依赖）
 
 import os
 import sqlite3
+import threading
 
 from src.common import paths
 
@@ -62,12 +63,43 @@ _SCHEMA = {
 # 哪些平台支持价值分析（kuaishou 无 value 评分）
 _VALUE_SUPPORTED = ("bili", "xhs", "douyin")
 
+_HISTORY_METRICS = {
+    "bili": [("play_nums", "播放"), ("like_count", "点赞"), ("favorites", "收藏"),
+             ("coin", "投币"), ("review", "评论"), ("danmakus", "弹幕"), ("share", "分享")],
+    "xhs": [("interact_count", "互动"), ("liked_count", "点赞"),
+            ("collected_count", "收藏"), ("comment_count", "评论"), ("share_count", "分享")],
+    "douyin": [("play_count", "播放"), ("liked_count", "点赞"),
+               ("comment_count", "评论"), ("share_count", "分享")],
+    "kuaishou": [("play_count", "播放"), ("liked_count", "点赞"),
+                 ("comment_count", "评论"), ("share_count", "分享")],
+}
+
+_ALGORITHM_FACTORS = {
+    ("bili", "momentum"): [("velocity_score", "播放速率", .30), ("conversion_score", "粉丝转化", .25),
+                           ("engagement_norm_score", "互动表现", .20), ("freshness_normalized", "新鲜度", .15),
+                           ("normalized_value", "播放规模", .10)],
+    ("bili", "value"): [("deep_ratio", "深度互动比", .35), ("engagement_density", "互动密度", .25),
+                        ("fav_rate", "收藏率", .20), ("conv_rate", "粉丝转化率", .10),
+                        ("share_rate", "分享率", .10)],
+    ("xhs", "momentum"): [("velocity_score", "互动速率", .35), ("engagement_norm_score", "互动密度", .30),
+                          ("freshness_normalized", "新鲜度", .20), ("normalized_value", "互动规模", .15)],
+    ("xhs", "value"): [("collect_score", "收藏率", .40), ("engage_score", "收藏互动密度", .30),
+                       ("comment_score", "评论率", .30)],
+    ("douyin", "momentum"): [("velocity_score", "互动速率", .35), ("density_score", "互动规模", .30),
+                             ("freshness_score", "新鲜度", .20), ("comment_activity_score", "评论活跃度", .15)],
+    ("douyin", "value"): [("collect_score", "收藏率", .35), ("share_score", "分享率", .25),
+                          ("comment_score", "评论率", .20), ("interact_score", "综合互动率", .20)],
+    ("kuaishou", "momentum"): [("velocity_score", "播放速率", .40), ("play_score", "播放规模", .25),
+                               ("engagement_score", "互动率", .20), ("freshness_score", "新鲜度", .15)],
+}
+
 
 def _connect(platform):
     db_file = _PLATFORM_DB[platform]
     if not os.path.exists(db_file):
         return None
-    conn = sqlite3.connect(db_file)
+    uri = "file:" + os.path.abspath(db_file).replace("\\", "/") + "?mode=ro"
+    conn = sqlite3.connect(uri, uri=True)
     conn.row_factory = sqlite3.Row
     return conn
 
@@ -102,7 +134,7 @@ def list_keywords(platform):
         kw = r["keyword"] or ""
         if kw not in groups:
             groups[kw] = {"keyword": kw, "task_count": 0, "done_count": 0,
-                          "dates": [], "task_ids": []}
+                          "dates": [], "task_ids": [], "last_task_at": None}
         g = groups[kw]
         g["task_count"] += 1
         if r["status"] == "completed":
@@ -111,9 +143,12 @@ def list_keywords(platform):
         if date and date not in g["dates"]:
             g["dates"].append(date)
         g["task_ids"].append(r["id"])
+        created_at = r["created_at"]
+        if created_at is not None and (g["last_task_at"] is None or str(created_at) > str(g["last_task_at"])):
+            g["last_task_at"] = created_at
     for g in groups.values():
         g["dates"].sort()
-    return list(groups.values())
+    return sorted(groups.values(), key=lambda g: str(g["last_task_at"] or ""), reverse=True)
 
 
 def list_snapshots(platform, keyword, min_videos=1):
@@ -164,13 +199,14 @@ def get_ranking(platform, keyword, analysis="momentum", limit=100):
         return []
     if analysis == "value" and platform not in _VALUE_SUPPORTED:
         return []
-    db_file = _PLATFORM_DB[platform]
-
+    conn = _connect(platform)
+    if conn is None:
+        return []
     db = None
     try:
         if platform == "bili":
             from src.bili import bili_util
-            db = bili_util.Database(db_file)
+            db = _readonly_database(bili_util.Database, conn)
             if analysis == "value":
                 rows = db.get_keyword_videos_for_value(keyword)
                 items = _bili_value_rank(rows)
@@ -178,36 +214,131 @@ def get_ranking(platform, keyword, analysis="momentum", limit=100):
                 items = db.get_keyword_momentum_ranking(keyword, "play_nums", limit)
         elif platform == "xhs":
             from src.xhs import xhs_util
-            db = xhs_util.Database(db_file)
+            db = _readonly_database(xhs_util.Database, conn)
             if analysis == "value":
                 items = db.get_value_ranking(keyword, limit)
             else:
                 items = db.get_keyword_momentum_ranking(keyword, limit)
         elif platform == "douyin":
             from src.douyin import douyin_util
-            db = douyin_util.Database(db_file)
+            db = _readonly_database(douyin_util.Database, conn)
             if analysis == "value":
                 items = db.get_value_ranking(keyword, limit)
             else:
                 items = db.get_keyword_momentum_ranking(keyword, limit)
         elif platform == "kuaishou":
             from src.kuaishou import kuaishou_util
-            db = kuaishou_util.Database(db_file)
+            conn.row_factory = sqlite3.Row
+            db = _readonly_database(kuaishou_util.Database, conn)
             items = db.get_keyword_momentum_ranking(keyword, limit)
         else:
+            return []
+        _attach_first_seen(conn, platform, items)
+        _attach_history(conn, platform, items)
+        _attach_algorithm(platform, analysis, items)
+    except sqlite3.OperationalError:
+        # Legacy schemas may miss columns expected by current scoring helpers.
+        # Upgrade an in-memory copy only; the source database remains read-only.
+        try:
+            memory = sqlite3.connect(":memory:")
+            conn.backup(memory)
+            conn.close()
+            conn = memory
+            conn.row_factory = sqlite3.Row
+            db = _readonly_database(type(db), conn)
+            db.create_tables()
+            if platform == "bili":
+                items = (_bili_value_rank(db.get_keyword_videos_for_value(keyword))
+                         if analysis == "value" else
+                         db.get_keyword_momentum_ranking(keyword, "play_nums", limit))
+            elif platform == "xhs":
+                items = (db.get_value_ranking(keyword, limit) if analysis == "value"
+                         else db.get_keyword_momentum_ranking(keyword, limit))
+            elif platform == "douyin":
+                items = (db.get_value_ranking(keyword, limit) if analysis == "value"
+                         else db.get_keyword_momentum_ranking(keyword, limit))
+            else:
+                items = db.get_keyword_momentum_ranking(keyword, limit)
+            _attach_first_seen(conn, platform, items)
+            _attach_history(conn, platform, items)
+            _attach_algorithm(platform, analysis, items)
+        except Exception:
             return []
     except Exception:
         return []
     finally:
         if db is not None:
             try:
-                conn = getattr(db, "conn", None)
-                if conn is not None:
-                    conn.close()
+                conn.close()
             except Exception:
                 pass
 
     return [_normalize_item(platform, i) for i in items]
+
+
+def _readonly_database(database_class, conn):
+    """Create a scoring helper without running its schema-mutating constructor."""
+    db = database_class.__new__(database_class)
+    db._local = threading.local()
+    db._local.conn = conn
+    db._db_file = _PLATFORM_DB.get(database_class.__module__.split(".")[-2], "")
+    return db
+
+
+def _attach_first_seen(conn, platform, items):
+    schema = _SCHEMA[platform]
+    id_col = schema["id_col"]
+    main_table = schema["main_table"]
+    history_table = schema["history_table"]
+    columns = {r[1] for r in conn.execute(f"PRAGMA table_info({main_table})")}
+    first_expr = "m.first_seen_at" if "first_seen_at" in columns else "NULL"
+    rows = conn.execute(f"""
+        SELECT m.{id_col}, COALESCE({first_expr}, MIN(h.record_time), m.fetched_at)
+        FROM {main_table} m
+        LEFT JOIN {history_table} h ON h.{id_col} = m.{id_col}
+        GROUP BY m.{id_col}
+    """).fetchall()
+    first_seen = {r[0]: r[1] for r in rows}
+    for item in items:
+        item["first_seen_at"] = first_seen.get(item.get(id_col))
+
+
+def _attach_history(conn, platform, items):
+    if not items:
+        return
+    schema = _SCHEMA[platform]
+    id_col = schema["id_col"]
+    history_table = schema["history_table"]
+    available = {r[1] for r in conn.execute(f"PRAGMA table_info({history_table})")}
+    metrics = [(key, label) for key, label in _HISTORY_METRICS[platform] if key in available]
+    ids = [item.get(id_col) for item in items if item.get(id_col) is not None]
+    placeholders = ",".join("?" for _ in ids)
+    selected = ", ".join(key for key, _ in metrics)
+    rows = conn.execute(
+        f"SELECT {id_col}, record_time{', ' + selected if selected else ''} "
+        f"FROM {history_table} WHERE {id_col} IN ({placeholders}) ORDER BY record_time",
+        ids,
+    ).fetchall()
+    grouped = {vid: [] for vid in ids}
+    for row in rows:
+        grouped.setdefault(row[0], []).append({
+            "record_time": row[1],
+            "metrics": [{"key": key, "label": label, "value": row[key]} for key, label in metrics],
+        })
+    for item in items:
+        item["history"] = grouped.get(item.get(id_col), [])
+
+
+def _attach_algorithm(platform, analysis, items):
+    factors = _ALGORITHM_FACTORS.get((platform, analysis), [])
+    for item in items:
+        item["algorithm"] = [{
+            "key": key, "label": label, "value": item.get(key), "weight": weight,
+        } for key, label, weight in factors]
+
+
+def _first_seen(item):
+    return item.get("first_seen_at") or item.get("fetched_at")
 
 
 def _normalize_item(platform, item):
@@ -219,12 +350,15 @@ def _normalize_item(platform, item):
             "author": item.get("uploader", "") or item.get("uploader_uid", ""),
             "author_uid": item.get("uploader_uid", ""),
             "metric_value": item.get("current_value", 0),
-            "score": item.get("composite_score", 0),
+            "score": item.get("composite_score", item.get("value_score", 0)),
             "growth_pct": item.get("historical_growth_pct"),
             "data_points": item.get("data_points", 1),
             "url": item.get("url", ""),
             "pubdate": item.get("pubdate", ""),
             "tags": item.get("tags", ""),
+            "first_seen_at": _first_seen(item),
+            "history": item.get("history", []),
+            "algorithm": item.get("algorithm", []),
             "raw": item,
         }
     elif platform == "xhs":
@@ -233,13 +367,16 @@ def _normalize_item(platform, item):
             "title": item.get("title", ""),
             "author": item.get("nickname", ""),
             "author_uid": item.get("user_id", ""),
-            "metric_value": item.get("current_value", 0),
-            "score": item.get("composite_score", 0),
+            "metric_value": item.get("current_value", item.get("interact_count", 0)),
+            "score": item.get("composite_score", item.get("value_score", 0)),
             "growth_pct": item.get("historical_growth_pct"),
             "data_points": item.get("data_points", 1),
             "url": item.get("share_link", "") or item.get("author_url", ""),
             "pubdate": item.get("pub_time", ""),
             "tags": item.get("tags", ""),
+            "first_seen_at": _first_seen(item),
+            "history": item.get("history", []),
+            "algorithm": item.get("algorithm", []),
             "raw": item,
         }
     elif platform == "douyin":
@@ -249,12 +386,15 @@ def _normalize_item(platform, item):
             "author": item.get("nickname", ""),
             "author_uid": item.get("user_id", ""),
             "metric_value": item.get("total_interact", 0) or item.get("current_value", 0),
-            "score": item.get("composite_score", 0),
+            "score": item.get("composite_score", item.get("value_score", 0)),
             "growth_pct": item.get("historical_growth_pct"),
             "data_points": item.get("data_points", 1),
             "url": item.get("page_url", "") or item.get("video_url", ""),
             "pubdate": item.get("pub_time", ""),
             "tags": item.get("tags", ""),
+            "first_seen_at": _first_seen(item),
+            "history": item.get("history", []),
+            "algorithm": item.get("algorithm", []),
             "raw": item,
         }
     elif platform == "kuaishou":
@@ -270,6 +410,9 @@ def _normalize_item(platform, item):
             "url": item.get("page_url", ""),
             "pubdate": "",
             "tags": "",
+            "first_seen_at": _first_seen(item),
+            "history": item.get("history", []),
+            "algorithm": item.get("algorithm", []),
             "raw": item,
         }
     return item

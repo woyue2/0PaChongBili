@@ -181,6 +181,7 @@ class Database:
                 tags TEXT,
                 category TEXT,
                 fetched_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                first_seen_at DATETIME DEFAULT CURRENT_TIMESTAMP,
                 FOREIGN KEY (task_id) REFERENCES spider_tasks(id)
             )
         """)
@@ -246,6 +247,15 @@ class Database:
 
         cursor.execute("PRAGMA table_info(bili_videos)")
         video_columns = [row[1] for row in cursor.fetchall()]
+
+        if "first_seen_at" not in video_columns:
+            cursor.execute("ALTER TABLE bili_videos ADD COLUMN first_seen_at DATETIME")
+        cursor.execute("""
+            UPDATE bili_videos SET first_seen_at = COALESCE(
+                (SELECT MIN(record_time) FROM video_history h WHERE h.av_id = bili_videos.av_id),
+                fetched_at
+            ) WHERE first_seen_at IS NULL
+        """)
 
         if "uploader_fans" not in video_columns:
             cursor.execute("ALTER TABLE bili_videos ADD COLUMN uploader_fans INTEGER DEFAULT 0")
@@ -505,8 +515,10 @@ class Database:
         cursor.execute("""
             SELECT DISTINCT v.av_id
             FROM bili_videos v
-            JOIN spider_tasks t ON v.task_id = t.id
-            WHERE t.keyword = ?
+            WHERE EXISTS (
+                SELECT 1 FROM video_history h JOIN spider_tasks t ON t.id = h.task_id
+                WHERE h.av_id = v.av_id AND t.keyword = ?
+            )
         """, (keyword,))
         return set(row[0] for row in cursor.fetchall())
 
@@ -587,8 +599,10 @@ class Database:
                    v.play_velocity, v.video_age_hours, v.engagement_score,
                    v.comment_count, v.like_count, v.coin, v.share, v.danmakus, v.review, v.tags
             FROM bili_videos v
-            JOIN spider_tasks t ON v.task_id = t.id
-            WHERE t.keyword = ?
+            WHERE EXISTS (
+                SELECT 1 FROM video_history h JOIN spider_tasks t ON t.id = h.task_id
+                WHERE h.av_id = v.av_id AND t.keyword = ?
+            )
             ORDER BY v.play_nums DESC
         """, (keyword,))
         videos = cursor.fetchall()
@@ -707,8 +721,10 @@ class Database:
                    v.like_count, v.coin, v.favorites, v.share, v.danmakus, v.review,
                    v.video_age_hours, v.pubdate, v.tags
             FROM bili_videos v
-            JOIN spider_tasks t ON v.task_id = t.id
-            WHERE t.keyword = ?
+            WHERE EXISTS (
+                SELECT 1 FROM video_history h JOIN spider_tasks t ON t.id = h.task_id
+                WHERE h.av_id = v.av_id AND t.keyword = ?
+            )
         """, (keyword,))
         return cursor.fetchall()
 

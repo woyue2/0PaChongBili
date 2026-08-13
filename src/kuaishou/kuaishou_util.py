@@ -80,7 +80,8 @@ class Database:
                 video_age_hours REAL NOT NULL DEFAULT 0,
                 play_velocity REAL NOT NULL DEFAULT 0,
                 engagement_rate REAL NOT NULL DEFAULT 0,
-                fetched_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
+                fetched_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                first_seen_at DATETIME DEFAULT CURRENT_TIMESTAMP
             );
 
             CREATE TABLE IF NOT EXISTS task_videos (
@@ -123,6 +124,14 @@ class Database:
                 ON video_history(video_id, record_time);
             """
         )
+        video_columns = {row[1] for row in self.conn.execute("PRAGMA table_info(ks_videos)")}
+        if "first_seen_at" not in video_columns:
+            self.conn.execute("ALTER TABLE ks_videos ADD COLUMN first_seen_at DATETIME")
+        self.conn.execute("""
+            UPDATE ks_videos SET first_seen_at = COALESCE(
+                (SELECT MIN(record_time) FROM video_history h WHERE h.video_id = ks_videos.video_id), fetched_at
+            ) WHERE first_seen_at IS NULL
+        """)
         self.conn.commit()
 
     def create_task(self, keyword, pages, order_by="general"):
@@ -262,9 +271,10 @@ class Database:
             """
             SELECT v.*
             FROM ks_videos v
-            JOIN task_videos tv ON tv.video_id = v.video_id
-            JOIN spider_tasks t ON t.id = tv.task_id
-            WHERE t.keyword = ?
+            WHERE EXISTS (
+                SELECT 1 FROM task_videos tv JOIN spider_tasks t ON t.id = tv.task_id
+                WHERE tv.video_id = v.video_id AND t.keyword = ?
+            )
             ORDER BY v.play_velocity DESC, v.play_count DESC
             """,
             (keyword,),
@@ -292,10 +302,13 @@ class Database:
             score = (
                 min(float(item["play_velocity"] or 0) / max_velocity, 1) * 0.40
                 + min(int(item["play_count"] or 0) / max_plays, 1) * 0.25
-                + min(float(item["engagement_rate"] or 0) / max_engagement, 1)
-                * 0.20
+                + min(float(item["engagement_rate"] or 0) / max_engagement, 1) * 0.20
                 + freshness * 0.15
             )
+            item["velocity_score"] = round(min(float(item["play_velocity"] or 0) / max_velocity, 1), 4)
+            item["play_score"] = round(min(int(item["play_count"] or 0) / max_plays, 1), 4)
+            item["engagement_score"] = round(min(float(item["engagement_rate"] or 0) / max_engagement, 1), 4)
+            item["freshness_score"] = freshness
             item["momentum_score"] = round(score, 4)
             results.append(item)
         results.sort(key=lambda item: item["momentum_score"], reverse=True)

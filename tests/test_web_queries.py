@@ -240,6 +240,8 @@ class WebQueriesCompareTests(unittest.TestCase):
         self.assertEqual(by_kw["服饰"]["task_count"], 2)
         self.assertEqual(by_kw["服饰"]["done_count"], 2)
         self.assertEqual(by_kw["服饰"]["dates"], ["2026-07-24", "2026-07-25"])
+        self.assertEqual(kws[0]["keyword"], "穷人")
+        self.assertEqual(by_kw["服饰"]["last_task_at"], "2026-07-25 10:00:00")
 
 
 class WebQueriesValueRankTests(unittest.TestCase):
@@ -297,6 +299,20 @@ class WebQueriesRankingTests(unittest.TestCase):
         self.assertEqual(it["author"], "作者甲")
         self.assertEqual(it["metric_value"], 888)
         self.assertGreaterEqual(it["score"], 0)
+        self.assertEqual(it["first_seen_at"], "2026-07-25 10:30:00")
+        self.assertEqual(it["history"][0]["metrics"][0]["label"], "互动")
+        self.assertEqual(it["history"][0]["metrics"][0]["value"], 888)
+        self.assertEqual(
+            [factor["label"] for factor in it["algorithm"]],
+            ["互动速率", "互动密度", "新鲜度", "互动规模"],
+        )
+
+    def test_readonly_query_does_not_migrate_source_schema(self):
+        before = {row[1] for row in self.conn.execute("PRAGMA table_info(xhs_notes)")}
+        self.assertNotIn("first_seen_at", before)
+        self.assertEqual(len(wq.get_ranking("xhs", "美食", "momentum")), 1)
+        after = {row[1] for row in self.conn.execute("PRAGMA table_info(xhs_notes)")}
+        self.assertEqual(after, before)
 
     def test_kuaishou_value_unsupported(self):
         self.assertEqual(wq.get_ranking("kuaishou", "x", "value"), [])

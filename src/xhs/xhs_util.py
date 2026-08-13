@@ -128,6 +128,7 @@ class Database:
                 interact_velocity REAL DEFAULT 0,
                 engagement_score REAL DEFAULT 0,
                 fetched_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                first_seen_at DATETIME DEFAULT CURRENT_TIMESTAMP,
                 share_link_status TEXT DEFAULT 'pending',
                 share_link_attempts INTEGER DEFAULT 0,
                 share_link_error TEXT,
@@ -139,6 +140,7 @@ class Database:
             row[1] for row in cursor.execute("PRAGMA table_info(xhs_notes)").fetchall()
         }
         note_column_migrations = {
+            "first_seen_at": "DATETIME",
             "share_link_status": "TEXT DEFAULT 'pending'",
             "share_link_attempts": "INTEGER DEFAULT 0",
             "share_link_error": "TEXT",
@@ -232,6 +234,11 @@ class Database:
         """)
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_history_note_id ON note_history(note_id)")
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_history_time ON note_history(record_time)")
+        cursor.execute("""
+            UPDATE xhs_notes SET first_seen_at = COALESCE(
+                (SELECT MIN(record_time) FROM note_history h WHERE h.note_id = xhs_notes.note_id), fetched_at
+            ) WHERE first_seen_at IS NULL
+        """)
 
         self.conn.commit()
 

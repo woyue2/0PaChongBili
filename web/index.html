@@ -76,6 +76,36 @@
   }
   .form-inline { display: flex; gap: 8px; }
   .form-inline .form-row { flex: 1; }
+  .keyword-combo { position: relative; }
+  .keyword-combo input { width: 100%; }
+  .keyword-combo select { display: none; }
+  .keyword-suggestions {
+    display: none;
+    position: absolute;
+    z-index: 20;
+    top: calc(100% + 4px);
+    left: 0;
+    right: 0;
+    max-height: 220px;
+    overflow-y: auto;
+    padding: 4px 0;
+    background: var(--bg);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    box-shadow: 0 8px 20px rgba(0,0,0,.35);
+  }
+  .keyword-suggestions.open { display: block; }
+  .keyword-suggestion {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 12px;
+    padding: 9px 12px;
+    color: var(--text);
+    cursor: pointer;
+  }
+  .keyword-suggestion:hover, .keyword-suggestion.active { background: #21262d; }
+  .keyword-suggestion-count { color: var(--muted); font-size: 12px; }
 
   button {
     padding: 9px 16px;
@@ -277,6 +307,36 @@
   .vc-tag { font-size: 11px; padding: 1px 8px; border-radius: 8px; background: var(--bg); border: 1px solid var(--border); color: var(--muted); }
   .vc-link { font-size: 12px; color: var(--accent); text-decoration: none; }
   .vc-link:hover { text-decoration: underline; }
+  .vc-detail-tabs { display: flex; gap: 16px; border-bottom: 1px solid var(--border); margin-top: 4px; }
+  .vc-detail-tab { border: 0; border-radius: 0; padding: 7px 0; background: transparent; color: var(--muted); font-size: 12px; border-bottom: 2px solid transparent; }
+  .vc-detail-tab:hover { background: transparent; color: var(--text); }
+  .vc-detail-tab.active { color: var(--accent); border-bottom-color: var(--accent); }
+  .vc-detail-panel { min-width: 0; }
+  .vc-detail-panel.hidden { display: none; }
+  .vc-history-track { display: flex; gap: 10px; overflow-x: auto; padding: 2px 1px 9px; cursor: grab; scroll-snap-type: x mandatory; scrollbar-color: var(--accent) transparent; }
+  .vc-history-track.dragging { cursor: grabbing; scroll-snap-type: none; user-select: none; }
+  .vc-snapshot { min-width: 210px; scroll-snap-align: start; background: var(--bg); border-left: 3px solid var(--accent); padding: 8px 10px; }
+  .vc-snapshot-time { font-size: 11px; color: var(--muted); margin-bottom: 7px; }
+  .vc-snapshot-head { display: flex; justify-content: space-between; gap: 8px; align-items: center; }
+  .vc-snapshot-action { border: 0; background: transparent; padding: 2px 4px; color: var(--muted); font-size: 11px; }
+  .vc-snapshot-action:hover { background: transparent; color: var(--accent); }
+  .vc-history-toolbar { display: flex; gap: 12px; align-items: center; margin-bottom: 8px; }
+  .vc-history-toolbar button { border: 0; background: transparent; padding: 3px 0; color: var(--accent); font-size: 11px; }
+  .vc-history-toolbar button:hover { background: transparent; text-decoration: underline; }
+  .vc-snapshot.hidden-day { display: none; opacity: .55; border-left-color: var(--muted); }
+  .vc-history-panel.show-hidden .vc-snapshot.hidden-day { display: block; }
+  .vc-snapshot.extra-point { display: none; }
+  .vc-history-panel.show-all-points .vc-snapshot.extra-point { display: block; }
+  .vc-metric-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 5px 10px; }
+  .vc-metric { display: flex; justify-content: space-between; gap: 6px; font-size: 11px; }
+  .vc-metric span { color: var(--muted); }
+  .vc-detail-empty, .vc-drag-hint { color: var(--muted); font-size: 11px; padding: 7px 0; }
+  .vc-algorithm { display: grid; gap: 8px; }
+  .vc-factor { display: grid; grid-template-columns: 76px 1fr 74px; gap: 7px; align-items: center; font-size: 11px; }
+  .vc-factor-name { color: var(--muted); }
+  .vc-factor-bar { height: 5px; background: var(--bg); border-radius: 3px; overflow: hidden; }
+  .vc-factor-fill { height: 100%; background: var(--accent); }
+  .vc-factor-value { text-align: right; white-space: nowrap; }
   .no-data { grid-column: 1/-1; text-align: center; color: var(--muted); padding: 40px 0; }
 
   /* 对比页 */
@@ -349,7 +409,10 @@
       </div>
       <div class="form-row">
         <label>关键词</label>
-        <input id="keyword" placeholder="例如: 服饰、美食、阶级跨越" value="服饰">
+        <div class="keyword-combo">
+          <div id="keywordSuggestions" class="keyword-suggestions" role="listbox"></div>
+          <input id="keyword" placeholder="输入新关键词" value="服饰">
+        </div>
       </div>
       <div class="form-inline">
         <div class="form-row">
@@ -606,6 +669,85 @@ function fmtDateTime(s) {
   return String(s).slice(0, 16).replace('T', ' ');
 }
 
+function renderHistory(history, hiddenDays, platform, videoId) {
+  if (!history || !history.length) return '<div class="vc-detail-empty">暂无历史采集指标</div>';
+  const hidden = new Set(hiddenDays || []);
+  const byDay = {};
+  history.forEach(snap => { const day = String(snap.record_time || '').slice(0, 10); (byDay[day] ||= []).push(snap); });
+  const visibleDays = Object.keys(byDay).filter(day => !hidden.has(day)).length;
+  const snapshots = Object.entries(byDay).flatMap(([day, points]) => points.map((snap, pointIndex) => `
+    <div class="vc-snapshot ${hidden.has(day) ? 'hidden-day' : ''} ${pointIndex < points.length - 1 ? 'extra-point' : ''}">
+      <div class="vc-snapshot-head">
+        <div class="vc-snapshot-time">${escapeHtml(fmtDateTime(snap.record_time))}${points.length > 1 ? ` · 当天${pointIndex + 1}/${points.length}` : ''}</div>
+        <button class="vc-snapshot-action" data-platform="${escapeHtml(platform)}" data-video-id="${escapeHtml(videoId)}" data-record-date="${day}" data-hidden="${hidden.has(day) ? 'false' : 'true'}">${hidden.has(day) ? '恢复' : '隐藏当天'}</button>
+      </div>
+      <div class="vc-metric-grid">${(snap.metrics || []).map(metric => `
+        <div class="vc-metric"><span>${escapeHtml(metric.label)}</span><b>${fmtNum(metric.value)}</b></div>`).join('')}
+      </div>
+    </div>`)).join('');
+  const multiPointDays = Object.values(byDay).filter(points => points.length > 1).length;
+  return `<div class="vc-history-panel">
+    <div class="vc-history-toolbar">
+      ${hidden.size ? `<button class="vc-toggle-hidden">显示已隐藏 (${hidden.size})</button>` : ''}
+      ${multiPointDays ? `<button class="vc-toggle-points">展开当天全部采集 (${multiPointDays}天)</button>` : ''}
+      <span class="vc-drag-hint">默认 ${visibleDays} 天，每天显示最新一次</span>
+    </div>
+    <div class="vc-history-track">${snapshots}</div><div class="vc-drag-hint">横向滚动或按住拖动查看</div>
+  </div>`;
+}
+
+function renderAlgorithm(factors) {
+  if (!factors || !factors.length) return '<div class="vc-detail-empty">该分析暂无算法明细</div>';
+  return `<div class="vc-algorithm">${factors.map(factor => {
+    const value = Number(factor.value || 0);
+    const width = Math.max(0, Math.min(100, value * 100));
+    return `<div class="vc-factor">
+      <span class="vc-factor-name">${escapeHtml(factor.label)}</span>
+      <div class="vc-factor-bar"><div class="vc-factor-fill" style="width:${width}%"></div></div>
+      <span class="vc-factor-value">${value.toFixed(3)} × ${Math.round(Number(factor.weight || 0) * 100)}%</span>
+    </div>`;
+  }).join('')}</div>`;
+}
+
+function initResultCardDetails(container) {
+  container.querySelectorAll('.video-card').forEach(card => {
+    card.querySelectorAll('.vc-detail-tab').forEach(tab => tab.onclick = () => {
+      card.querySelectorAll('.vc-detail-tab').forEach(t => t.classList.toggle('active', t === tab));
+      card.querySelectorAll('.vc-detail-panel').forEach(panel => panel.classList.toggle('hidden', panel.dataset.panel !== tab.dataset.target));
+    });
+    const historyPanel = card.querySelector('.vc-history-panel');
+    const hiddenToggle = card.querySelector('.vc-toggle-hidden');
+    if (hiddenToggle) hiddenToggle.onclick = () => {
+      historyPanel.classList.toggle('show-hidden');
+      hiddenToggle.textContent = historyPanel.classList.contains('show-hidden') ? '隐藏已隐藏数据' : hiddenToggle.textContent.replace('隐藏已隐藏数据', '显示已隐藏');
+    };
+    const pointsToggle = card.querySelector('.vc-toggle-points');
+    if (pointsToggle) pointsToggle.onclick = () => {
+      historyPanel.classList.toggle('show-all-points');
+      pointsToggle.textContent = historyPanel.classList.contains('show-all-points') ? '收起当天重复采集' : '展开当天全部采集';
+    };
+    card.querySelectorAll('.vc-snapshot-action').forEach(button => button.onclick = async e => {
+      e.stopPropagation();
+      button.disabled = true;
+      try {
+        await api('/api/history-visibility', {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({
+          platform: button.dataset.platform, video_id: button.dataset.videoId,
+          record_date: button.dataset.recordDate, hidden: button.dataset.hidden === 'true'
+        })});
+        await loadResults();
+      } catch (error) { alert('保存显示设置失败: ' + error.message); button.disabled = false; }
+    });
+    const track = card.querySelector('.vc-history-track');
+    if (!track) return;
+    let dragging = false, startX = 0, startScroll = 0;
+    track.onpointerdown = e => { dragging = true; startX = e.clientX; startScroll = track.scrollLeft; track.classList.add('dragging'); track.setPointerCapture(e.pointerId); };
+    track.onpointermove = e => { if (dragging) track.scrollLeft = startScroll - (e.clientX - startX); };
+    const stop = () => { dragging = false; track.classList.remove('dragging'); };
+    track.onpointerup = stop;
+    track.onpointercancel = stop;
+  });
+}
+
 // ---------- 页签切换 ----------
 function switchView(name) {
   document.querySelectorAll('.tab').forEach(t => t.classList.toggle('active', t.dataset.view === name));
@@ -729,6 +871,7 @@ async function loadResults() {
           </div>
           <div class="vc-title">${escapeHtml(it.title)}</div>
           <div class="vc-meta">${escapeHtml(it.author || '未知作者')}</div>
+          <div class="vc-meta">首次收录：${fmtDateTime(it.first_seen_at) || '-'}</div>
           <div class="vc-stats">
             <span class="vc-stat">🔥 <b>${fmtNum(it.metric_value)}</b></span>
             <span class="vc-stat">📅 ${fmtDate(it.pubdate)}</span>
@@ -739,12 +882,19 @@ async function loadResults() {
             <span class="vc-score-val">${Number(it.score || 0).toFixed(3)}</span>
           </div>
           ${growthHtml}
+          <div class="vc-detail-tabs">
+            <button class="vc-detail-tab active" data-target="history">历史指标</button>
+            <button class="vc-detail-tab" data-target="algorithm">算法明细</button>
+          </div>
+          <div class="vc-detail-panel" data-panel="history">${renderHistory(it.history, it.hidden_history_days, platform, it.id)}</div>
+          <div class="vc-detail-panel hidden" data-panel="algorithm">${renderAlgorithm(it.algorithm)}</div>
           ${it.tags ? `<div class="vc-tags">${it.tags.split(',').slice(0,3).map(t => `<span class="vc-tag">${escapeHtml(t)}</span>`).join('')}</div>` : ''}
           ${url}
         </div>`;
     });
     html += '</div>';
     el.innerHTML = html;
+    initResultCardDetails(el);
   } catch (e) {
     el.innerHTML = `<div class="empty">加载失败: ${escapeHtml(e.message)}</div>`;
   }
@@ -890,9 +1040,54 @@ $('cCompareBtn').onclick = async () => {
 };
 
 // ---------- 表单 ----------
+async function loadKeywordHistory() {
+  try {
+    const data = await api('/api/analyses');
+    const info = data[$('platform').value] || {keywords: []};
+    for (const kw of info.keywords) {
+      const option = document.createElement('option');
+      option.value = kw.keyword;
+      option.textContent = `${kw.keyword} (${kw.task_count}次)`;
+    }
+  } catch (_) {
+  }
+}
+
+// Chrome 风格：历史记录属于输入框本身，聚焦或输入时显示匹配建议。
+window.keywordHistoryItems = [];
+function closeKeywordSuggestions() {
+  $('keywordSuggestions').classList.remove('open');
+}
+function renderKeywordSuggestions() {
+  const input = $('keyword');
+  const query = input.value.trim().toLowerCase();
+  const items = window.keywordHistoryItems.filter(item =>
+    !query || item.keyword.toLowerCase().includes(query));
+  $('keywordSuggestions').innerHTML = items.map(item =>
+    `<div class="keyword-suggestion" role="option" data-keyword="${escapeHtml(item.keyword)}"><span>${escapeHtml(item.keyword)}</span><span class="keyword-suggestion-count">${item.task_count}次</span></div>`
+  ).join('');
+  $('keywordSuggestions').classList.toggle('open', items.length > 0 && document.activeElement === input);
+}
+loadKeywordHistory = async function() {
+  const data = await api('/api/analyses');
+  window.keywordHistoryItems = (data[$('platform').value] || {keywords: []}).keywords || [];
+  renderKeywordSuggestions();
+};
+$('keywordSuggestions').onclick = e => {
+  const item = e.target.closest('.keyword-suggestion');
+  if (!item) return;
+  $('keyword').value = item.dataset.keyword;
+  closeKeywordSuggestions();
+  $('keyword').focus();
+};
+$('keyword').onfocus = renderKeywordSuggestions;
+$('keyword').oninput = renderKeywordSuggestions;
+$('keyword').onblur = () => setTimeout(closeKeywordSuggestions, 120);
+
 $('platform').onchange = () => {
   const p = $('platform').value;
   $('modeRow').style.display = p === 'bili' ? '' : 'none';
+  loadKeywordHistory();
 };
 
 $('startBtn').onclick = async () => {
@@ -955,6 +1150,7 @@ setInterval(() => {
 // 启动
 health();
 refreshTasks();
+loadKeywordHistory();
 </script>
 </body>
 </html>

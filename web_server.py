@@ -26,7 +26,7 @@ from collections import deque
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
 
-from src.common import web_queries
+from src.common import web_preferences, web_queries
 
 PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
 WEB_DIR = os.path.join(PROJECT_ROOT, "web")
@@ -73,6 +73,7 @@ def task_runner(task):
     """后台线程：启动子进程，逐行读取 print 输出写入任务日志。"""
     env = dict(os.environ)
     env["PYTHONIOENCODING"] = "utf-8"  # 保证子进程 stdout 是 UTF-8
+    env["PYTHONUNBUFFERED"] = "1"
     try:
         proc = subprocess.Popen(
             task["command"],
@@ -255,6 +256,23 @@ class Handler(BaseHTTPRequestHandler):
                 return
             self._send_json(task_to_dict(task), 201)
 
+        elif path == "/api/history-visibility":
+            body = self._read_json()
+            platform = body.get("platform")
+            video_id = str(body.get("video_id") or "").strip()
+            record_date = str(body.get("record_date") or "").strip()
+            hidden = body.get("hidden") is True
+            if platform not in PLATFORMS or not video_id or len(record_date) != 10:
+                self._send_json({"error": "platform/video_id/record_date 参数无效"}, 400)
+                return
+            try:
+                time.strptime(record_date, "%Y-%m-%d")
+            except ValueError:
+                self._send_json({"error": "record_date 需为 YYYY-MM-DD"}, 400)
+                return
+            web_preferences.set_hidden(platform, video_id, record_date, hidden)
+            self._send_json({"ok": True, "hidden": hidden})
+
         elif path.startswith("/api/tasks/") and path.endswith("/kill"):
             parts = path.strip("/").split("/")
             # /api/tasks/<id>/kill
@@ -308,7 +326,16 @@ class Handler(BaseHTTPRequestHandler):
         if not keyword:
             self._send_json({"error": "缺少 keyword 参数"}, 400)
             return
+        if analysis not in ("momentum", "value"):
+            self._send_json({"error": "analysis 仅支持 momentum 或 value"}, 400)
+            return
+        if analysis == "value" and platform == "kuaishou":
+            self._send_json({"error": "快手暂不支持 value 分析"}, 400)
+            return
         items = web_queries.get_ranking(platform, keyword, analysis)
+        hidden = web_preferences.list_hidden_days(platform, [item.get("id") for item in items])
+        for item in items:
+            item["hidden_history_days"] = hidden.get(str(item.get("id")), [])
         self._send_json({
             "platform": platform,
             "platform_name": PLATFORMS[platform]["name"],
