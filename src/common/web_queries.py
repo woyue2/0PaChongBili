@@ -234,6 +234,7 @@ def get_ranking(platform, keyword, analysis="momentum", limit=100):
         else:
             return []
         _attach_first_seen(conn, platform, items)
+        _attach_urls(conn, platform, items)
         _attach_history(conn, platform, items)
         _attach_algorithm(platform, analysis, items)
     except sqlite3.OperationalError:
@@ -260,6 +261,7 @@ def get_ranking(platform, keyword, analysis="momentum", limit=100):
             else:
                 items = db.get_keyword_momentum_ranking(keyword, limit)
             _attach_first_seen(conn, platform, items)
+            _attach_urls(conn, platform, items)
             _attach_history(conn, platform, items)
             _attach_algorithm(platform, analysis, items)
         except Exception:
@@ -301,6 +303,37 @@ def _attach_first_seen(conn, platform, items):
     first_seen = {r[0]: r[1] for r in rows}
     for item in items:
         item["first_seen_at"] = first_seen.get(item.get(id_col))
+
+
+def _attach_urls(conn, platform, items):
+    """Fill each platform's canonical work URL from its main table."""
+    if not items:
+        return
+    schema = _SCHEMA[platform]
+    id_col = schema["id_col"]
+    main_table = schema["main_table"]
+    columns = {r[1] for r in conn.execute(f"PRAGMA table_info({main_table})")}
+    url_col = {"bili": "url", "xhs": "url", "douyin": "video_url", "kuaishou": "page_url"}[platform]
+    if url_col not in columns:
+        return
+    ids = [item.get(id_col) for item in items if item.get(id_col) is not None]
+    placeholders = ",".join("?" for _ in ids)
+    rows = conn.execute(
+        f"SELECT {id_col}, {url_col} FROM {main_table} WHERE {id_col} IN ({placeholders})", ids
+    ).fetchall()
+    urls = {str(row[0]): row[1] or "" for row in rows}
+    for item in items:
+        vid = str(item.get(id_col) or "")
+        url = urls.get(vid, "")
+        if platform == "bili" and not url and vid:
+            url = f"https://www.bilibili.com/video/av{vid}"
+        if platform == "xhs":
+            item["share_link"] = item.get("share_link") or url
+        elif platform == "douyin":
+            item["page_url"] = item.get("page_url") or (f"https://www.douyin.com/video/{vid}" if vid else "")
+            item["video_url"] = item.get("video_url") or url
+        else:
+            item["url" if platform == "bili" else "page_url"] = item.get("url" if platform == "bili" else "page_url") or url
 
 
 def _attach_history(conn, platform, items):

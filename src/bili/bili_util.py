@@ -597,7 +597,7 @@ class Database:
         cursor.execute("""
             SELECT v.av_id, v.title, v.play_nums, v.pubdate, v.uploader, v.uploader_uid, v.uploader_fans,
                    v.play_velocity, v.video_age_hours, v.engagement_score,
-                   v.comment_count, v.like_count, v.coin, v.share, v.danmakus, v.review, v.tags
+                   v.comment_count, v.like_count, v.coin, v.share, v.danmakus, v.review, v.tags, v.url
             FROM bili_videos v
             WHERE EXISTS (
                 SELECT 1 FROM video_history h JOIN spider_tasks t ON t.id = h.task_id
@@ -631,7 +631,7 @@ class Database:
         for video in videos:
             (av_id, title, current_plays, pubdate, uploader, uploader_uid, uploader_fans,
              play_velocity, video_age_hours, engagement_raw,
-             comment_count, like_count, coin, share, danmakus, review, tags_str) = video
+             comment_count, like_count, coin, share, danmakus, review, tags_str, url) = video
 
             current_plays = int(current_plays or 0)
             uploader_fans = int(uploader_fans or 0)
@@ -679,6 +679,7 @@ class Database:
             video_info = {
                 "av_id": av_id,
                 "title": title,
+                "url": url or "",
                 "current_value": current_plays,
                 "pubdate": pubdate,
                 "uploader": uploader,

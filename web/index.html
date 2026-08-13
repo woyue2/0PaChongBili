@@ -292,6 +292,8 @@
     display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical;
     overflow: hidden; min-height: 40px;
   }
+  .vc-title-link { color: inherit; text-decoration: none; }
+  .vc-title-link:hover { color: var(--accent); text-decoration: underline; }
   .vc-meta { font-size: 12px; color: var(--muted); }
   .vc-stats { display: flex; gap: 12px; font-size: 12px; flex-wrap: wrap; }
   .vc-stat b { color: var(--text); }
@@ -862,14 +864,17 @@ async function loadResults() {
       const growthHtml = growth === null || growth === undefined
         ? '<span class="vc-growth none">首次采集</span>'
         : `<span class="vc-growth up">↗ ${growth > 0 ? '+' : ''}${Number(growth).toFixed(1)}%</span>`;
-      const url = it.url ? `<a class="vc-link" href="${escapeHtml(it.url)}" target="_blank">打开 ↗</a>` : '';
+      const url = it.url ? `<a class="vc-link" href="${escapeHtml(it.url)}" target="_blank" rel="noopener noreferrer">打开 ↗</a>` : '';
+      const title = it.url
+        ? `<a class="vc-title-link" href="${escapeHtml(it.url)}" target="_blank" rel="noopener noreferrer">${escapeHtml(it.title)}</a>`
+        : escapeHtml(it.title);
       html += `
         <div class="video-card">
           <div class="vc-top">
             <div class="vc-rank ${rank <= 3 ? 'top' : ''}">${rank}</div>
             <span class="vc-platform">${escapeHtml(data.platform_name)}</span>
           </div>
-          <div class="vc-title">${escapeHtml(it.title)}</div>
+          <div class="vc-title">${title}</div>
           <div class="vc-meta">${escapeHtml(it.author || '未知作者')}</div>
           <div class="vc-meta">首次收录：${fmtDateTime(it.first_seen_at) || '-'}</div>
           <div class="vc-stats">
