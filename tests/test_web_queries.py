@@ -243,6 +243,10 @@ class WebQueriesCompareTests(unittest.TestCase):
         self.assertEqual(kws[0]["keyword"], "穷人")
         self.assertEqual(by_kw["服饰"]["last_task_at"], "2026-07-25 10:00:00")
 
+    def test_list_ranking_dates_only_returns_dates_with_history(self):
+        self.assertEqual(wq.list_ranking_dates("bili", "服饰"), ["2026-07-25", "2026-07-24"])
+        self.assertEqual(wq.list_ranking_dates("bili", "不存在"), [])
+
 
 class WebQueriesValueRankTests(unittest.TestCase):
     """B站价值评分复用逻辑"""
@@ -313,6 +317,37 @@ class WebQueriesRankingTests(unittest.TestCase):
         self.assertEqual(len(wq.get_ranking("xhs", "美食", "momentum")), 1)
         after = {row[1] for row in self.conn.execute("PRAGMA table_info(xhs_notes)")}
         self.assertEqual(after, before)
+
+    def test_as_of_date_uses_last_snapshot_and_excludes_future_discoveries(self):
+        self.conn.execute(
+            "INSERT INTO spider_tasks (id, keyword, pages, order_by, status, created_at) "
+            "VALUES (2, '美食', 1, 'general', 'completed', '2026-07-27 10:00:00')"
+        )
+        self.conn.execute(
+            "INSERT INTO task_notes (task_id, note_id, search_rank) VALUES (2, 'n1', 1)"
+        )
+        self.conn.execute(
+            "INSERT INTO note_history (note_id, task_id, interact_count, record_time) "
+            "VALUES ('n1', 2, 1888, '2026-07-27 10:30:00')"
+        )
+        self.conn.execute(
+            "INSERT INTO xhs_notes (task_id, note_id, title, interact_count, nickname, user_id) "
+            "VALUES (2, 'future', '未来笔记', 9999, '作者乙', 'u2')"
+        )
+        self.conn.execute(
+            "INSERT INTO task_notes (task_id, note_id, search_rank) VALUES (2, 'future', 2)"
+        )
+        self.conn.execute(
+            "INSERT INTO note_history (note_id, task_id, interact_count, record_time) "
+            "VALUES ('future', 2, 9999, '2026-07-27 10:31:00')"
+        )
+        self.conn.execute("UPDATE xhs_notes SET interact_count = 1888 WHERE note_id = 'n1'")
+        self.conn.commit()
+
+        items = wq.get_ranking("xhs", "美食", "momentum", as_of_date="2026-07-25")
+        self.assertEqual([item["id"] for item in items], ["n1"])
+        self.assertEqual(items[0]["metric_value"], 888)
+        self.assertEqual(len(items[0]["history"]), 1)
 
     def test_kuaishou_value_unsupported(self):
         self.assertEqual(wq.get_ranking("kuaishou", "x", "value"), [])

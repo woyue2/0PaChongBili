@@ -129,6 +129,7 @@ class Database:
                 engagement_score REAL DEFAULT 0,
                 fetched_at DATETIME DEFAULT CURRENT_TIMESTAMP,
                 first_seen_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                collection_status TEXT DEFAULT 'placeholder',
                 share_link_status TEXT DEFAULT 'pending',
                 share_link_attempts INTEGER DEFAULT 0,
                 share_link_error TEXT,
@@ -141,6 +142,15 @@ class Database:
         }
         note_column_migrations = {
             "first_seen_at": "DATETIME",
+            "collection_status": "TEXT DEFAULT 'placeholder'",
+            "interact_count": "INTEGER DEFAULT 0",
+            "liked_count": "INTEGER DEFAULT 0",
+            "collected_count": "INTEGER DEFAULT 0",
+            "comment_count": "INTEGER DEFAULT 0",
+            "share_count": "INTEGER DEFAULT 0",
+            "nickname": "TEXT",
+            "user_id": "TEXT",
+            "note_type": "TEXT",
             "share_link_status": "TEXT DEFAULT 'pending'",
             "share_link_attempts": "INTEGER DEFAULT 0",
             "share_link_error": "TEXT",
@@ -155,7 +165,6 @@ class Database:
 
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_notes_task_id ON xhs_notes(task_id)")
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_notes_note_id ON xhs_notes(note_id)")
-
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS task_notes (
                 task_id INTEGER NOT NULL,
@@ -235,6 +244,14 @@ class Database:
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_history_note_id ON note_history(note_id)")
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_history_time ON note_history(record_time)")
         cursor.execute("""
+            UPDATE xhs_notes SET collection_status = CASE
+                WHEN EXISTS (SELECT 1 FROM note_history h WHERE h.note_id = xhs_notes.note_id) THEN 'detail'
+                WHEN COALESCE(interact_count, 0) > 0 OR COALESCE(TRIM(nickname), '') <> '' THEN 'search_only'
+                ELSE 'placeholder'
+            END
+            WHERE collection_status IS NULL OR collection_status = '' OR collection_status = 'placeholder'
+        """)
+        cursor.execute("""
             UPDATE xhs_notes SET first_seen_at = COALESCE(
                 (SELECT MIN(record_time) FROM note_history h WHERE h.note_id = xhs_notes.note_id), fetched_at
             ) WHERE first_seen_at IS NULL
@@ -270,19 +287,58 @@ class Database:
         return dict(zip(keys, row))
 
     def link_task_note(
-        self, task_id, note_id, search_rank=None, xsec_token="", title=""
+        self, task_id, note_id, search_rank=None, xsec_token="", title="",
+        search_data=None,
     ):
         if not task_id or not note_id:
             return
         now = datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
+        data = search_data or {}
+        liked = int(data.get("liked_count", 0) or 0)
+        collected = int(data.get("collected_count", 0) or 0)
+        comment = int(data.get("comment_count", 0) or 0)
+        share = int(data.get("share_count", 0) or 0)
+        interact = int(data.get("interact_count", 0) or 0)
+        nickname = (data.get("nickname") or "").strip()
+        user_id = (data.get("user_id") or "").strip()
+        note_type = data.get("note_type") or ""
+        has_search_data = bool(interact or liked or collected or comment or share or nickname or user_id)
+        status = "search_only" if has_search_data else "placeholder"
         self.conn.execute(
             """
             INSERT OR IGNORE INTO xhs_notes (
-                task_id, note_id, title, xsec_token, fetched_at,
+                task_id, note_id, title, xsec_token, fetched_at, first_seen_at,
+                interact_count, liked_count, collected_count, comment_count, share_count,
+                nickname, user_id, note_type, collection_status,
                 share_link_status, share_link_attempts
-            ) VALUES (?, ?, ?, ?, ?, 'pending', 0)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', 0)
             """,
-            (task_id, note_id, title, xsec_token, now),
+            (task_id, note_id, title, xsec_token, now, now, interact, liked,
+             collected, comment, share, nickname, user_id, note_type, status),
+        )
+        self.conn.execute(
+            """
+            UPDATE xhs_notes SET
+                title = COALESCE(NULLIF(?, ''), title),
+                xsec_token = COALESCE(NULLIF(?, ''), xsec_token),
+                interact_count = CASE WHEN ? > 0 THEN ? ELSE interact_count END,
+                liked_count = CASE WHEN ? > 0 THEN ? ELSE liked_count END,
+                collected_count = CASE WHEN ? > 0 THEN ? ELSE collected_count END,
+                comment_count = CASE WHEN ? > 0 THEN ? ELSE comment_count END,
+                share_count = CASE WHEN ? > 0 THEN ? ELSE share_count END,
+                nickname = COALESCE(NULLIF(?, ''), nickname),
+                user_id = COALESCE(NULLIF(?, ''), user_id),
+                note_type = COALESCE(NULLIF(?, ''), note_type),
+                collection_status = CASE
+                    WHEN collection_status = 'detail' THEN 'detail'
+                    WHEN ? = 1 THEN 'search_only'
+                    ELSE collection_status
+                END
+            WHERE note_id = ?
+            """,
+            (title, xsec_token, interact, interact, liked, liked, collected, collected,
+             comment, comment, share, share, nickname, user_id, note_type,
+             1 if has_search_data else 0, note_id),
         )
         self.conn.execute(
             """
@@ -302,6 +358,21 @@ class Database:
                 now,
             ),
         )
+        if has_search_data:
+            self.conn.execute(
+                """
+                INSERT INTO note_history (
+                    note_id, task_id, interact_count, liked_count, collected_count,
+                    comment_count, share_count, record_time
+                )
+                SELECT ?, ?, ?, ?, ?, ?, ?, ?
+                WHERE NOT EXISTS (
+                    SELECT 1 FROM note_history WHERE task_id = ? AND note_id = ?
+                )
+                """,
+                (note_id, task_id, interact, liked, collected, comment, share, now,
+                 task_id, note_id),
+            )
         self.conn.commit()
 
     def get_existing_share_link(self, note_id):
@@ -469,6 +540,7 @@ class Database:
                     interact_velocity = ?,
                     engagement_score = ?,
                     fetched_at = ?,
+                    collection_status = 'detail',
                     share_link_status = ?,
                     share_link_attempts = COALESCE(share_link_attempts, 0) + ?,
                     share_link_error = ?,
@@ -511,9 +583,9 @@ class Database:
                     interact_count, liked_count, collected_count, comment_count, share_count,
                     nickname, user_id, author_url, fans_count, pub_time, note_type,
                     description, tags, category, note_age_hours, interact_velocity,
-                    engagement_score, fetched_at, share_link_status,
+                    engagement_score, fetched_at, first_seen_at, collection_status, share_link_status,
                     share_link_attempts, share_link_error, share_link_fetched_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'detail', ?, ?, ?, ?)
             """, (
                 task_id, note_id,
                 note_data.get("title"),
@@ -537,6 +609,7 @@ class Database:
                 note_data.get("interact_velocity", 0),
                 note_data.get("engagement_score", 0),
                 now,
+                now,
                 link_status,
                 1 if note_data.get("share_link_attempted") else 0,
                 link_error,
@@ -554,19 +627,26 @@ class Database:
         )
 
         cursor.execute("""
-            INSERT INTO note_history (
+            UPDATE note_history SET
+                interact_count = ?, liked_count = ?, collected_count = ?,
+                comment_count = ?, share_count = ?, record_time = ?
+            WHERE task_id = ? AND note_id = ?
+        """, (
+            note_data.get("interact_count", 0), note_data.get("liked_count", 0),
+            note_data.get("collected_count", 0), note_data.get("comment_count", 0),
+            note_data.get("share_count", 0), now, task_id, note_id,
+        ))
+        if cursor.rowcount == 0:
+            cursor.execute("""
+                INSERT INTO note_history (
                 note_id, task_id, interact_count, liked_count, collected_count,
                 comment_count, share_count, record_time
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-        """, (
-            note_id, task_id,
-            note_data.get("interact_count", 0),
-            note_data.get("liked_count", 0),
-            note_data.get("collected_count", 0),
-            note_data.get("comment_count", 0),
-            note_data.get("share_count", 0),
-            now,
-        ))
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """, (
+                note_id, task_id, note_data.get("interact_count", 0),
+                note_data.get("liked_count", 0), note_data.get("collected_count", 0),
+                note_data.get("comment_count", 0), note_data.get("share_count", 0), now,
+            ))
 
         self.conn.commit()
         return note_db_id
@@ -633,6 +713,7 @@ class Database:
                 JOIN spider_tasks t ON t.id = tn.task_id
                 WHERE t.keyword = ?
             )
+              AND COALESCE(n.collection_status, 'detail') <> 'placeholder'
             ORDER BY n.interact_count DESC
         """, (keyword,))
         notes = cursor.fetchall()
@@ -769,6 +850,7 @@ class Database:
                 JOIN spider_tasks t ON t.id = tn.task_id
                 WHERE t.keyword = ?
             )
+              AND COALESCE(n.collection_status, 'detail') <> 'placeholder'
               AND n.liked_count > 0
             ORDER BY n.interact_count DESC
         """, (keyword,))

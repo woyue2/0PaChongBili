@@ -1283,15 +1283,16 @@ async function health() {
 }
 
 // 轮询任务列表（运行中 1s，否则 3s）
-setInterval(() => {
+async function pollTasks() {
   health();
+  await refreshTasks();
   const running = Object.values(tasksMap).some(t => t.status === 'running' || t.status === 'starting');
-  refreshTasks();
-}, running ? 1000 : 3000);
+  setTimeout(pollTasks, running ? 1000 : 3000);
+}
 
 // 启动
 health();
-refreshTasks();
+pollTasks();
 loadKeywordHistory();
 </script>
 </body>

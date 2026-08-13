@@ -398,7 +398,8 @@ class XhsSpider:
             if not note_id:
                 continue
             ii = nc.get("interact_info", {}) or {}
-            user = nc.get("user", {}) or {}
+            user = (nc.get("user") or nc.get("author") or item.get("user")
+                    or item.get("author") or {})
             xsec_token = item.get("xsec_token", "") or nc.get("xsec_token", "")
 
             liked = _parse_chinese_num(ii.get("liked_count", 0))
@@ -418,8 +419,10 @@ class XhsSpider:
                 "comment_count": comment,
                 "share_count": share,
                 "interact_count": interact,
-                "nickname": user.get("nickname", ""),
-                "user_id": user.get("user_id", ""),
+                "nickname": (user.get("nickname") or user.get("nick_name")
+                             or user.get("name") or ""),
+                "user_id": (user.get("user_id") or user.get("userid")
+                            or user.get("id") or ""),
                 "note_type": nc.get("type", ""),
                 "source": "search",
             })
@@ -1446,11 +1449,11 @@ class XhsSpider:
                 note_ids_seen.add(n["note_id"])
                 all_notes.append(n)
                 self.db.link_task_note(
-                    self.task_id,
-                    n["note_id"],
+                    self.task_id, n["note_id"],
                     search_rank=len(all_notes),
                     xsec_token=n.get("xsec_token", ""),
                     title=n.get("title", ""),
+                    search_data=n,
                 )
 
         self.log(f"[任务] 第1页搜索到 {len(notes)} 条，累计 {len(all_notes)} 条")
@@ -1508,11 +1511,11 @@ class XhsSpider:
                             note_ids_seen.add(n["note_id"])
                             all_notes.append(n)
                             self.db.link_task_note(
-                                self.task_id,
-                                n["note_id"],
+                                self.task_id, n["note_id"],
                                 search_rank=len(all_notes),
                                 xsec_token=n.get("xsec_token", ""),
                                 title=n.get("title", ""),
+                                search_data=n,
                             )
                             new_count += 1
                     if new_count > 0:
