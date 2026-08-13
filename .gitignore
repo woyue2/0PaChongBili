@@ -18,6 +18,9 @@ data/*.db-shm
 
 output/
 
+# Local browser login sessions and authentication cookies
+config/*cookie*.txt
+
 sandbox/
 feeling.txt
 command
