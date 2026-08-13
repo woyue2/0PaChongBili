@@ -24,7 +24,9 @@ import time
 import uuid
 from collections import deque
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from urllib.parse import urlparse
+from urllib.parse import urlparse, parse_qs
+
+from src.common import web_queries
 
 PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
 WEB_DIR = os.path.join(PROJECT_ROOT, "web")
@@ -205,6 +207,9 @@ class Handler(BaseHTTPRequestHandler):
             self._send_json({"ok": True, "project": "0PaChongBili"})
         elif path == "/api/platforms":
             self._send_json(PLATFORMS)
+        elif path == "/api/analyses":
+            # 所有平台的关键词概览（供结果页/对比页下拉）
+            self._handle_analyses()
         elif path == "/api/tasks":
             with TASKS_LOCK:
                 tasks = [task_to_dict(t) for t in TASKS.values()]
@@ -217,6 +222,10 @@ class Handler(BaseHTTPRequestHandler):
                 self._stream_logs(parts[2])
             else:
                 self._send_json({"error": "not found"}, 404)
+        elif path.startswith("/api/results/"):
+            self._handle_results(path)
+        elif path.startswith("/api/snapshots/"):
+            self._handle_snapshots(path)
         else:
             self._send_json({"error": "not found"}, 404)
 
@@ -270,6 +279,90 @@ class Handler(BaseHTTPRequestHandler):
 
         else:
             self._send_json({"error": "not found"}, 404)
+
+    # ---------- 结果/快照 API ----------
+    def _handle_analyses(self):
+        """GET /api/analyses → {platform: {name, keywords: [...]}}"""
+        result = {}
+        for platform in PLATFORMS:
+            kws = web_queries.list_keywords(platform)
+            result[platform] = {
+                "name": PLATFORMS[platform]["name"],
+                "keywords": kws,
+            }
+        self._send_json(result)
+
+    def _handle_results(self, path):
+        """GET /api/results/<platform>?keyword=&analysis= → 排行列表"""
+        parts = path.strip("/").split("/")
+        if len(parts) != 3:
+            self._send_json({"error": "bad path"}, 400)
+            return
+        platform = parts[2]
+        qs = parse_qs(urlparse(self.path).query)
+        keyword = (qs.get("keyword") or [""])[0].strip()
+        analysis = (qs.get("analysis") or ["momentum"])[0]
+        if platform not in PLATFORMS:
+            self._send_json({"error": f"未知平台: {platform}"}, 400)
+            return
+        if not keyword:
+            self._send_json({"error": "缺少 keyword 参数"}, 400)
+            return
+        items = web_queries.get_ranking(platform, keyword, analysis)
+        self._send_json({
+            "platform": platform,
+            "platform_name": PLATFORMS[platform]["name"],
+            "keyword": keyword,
+            "analysis": analysis,
+            "value_supported": platform in ("bili", "xhs", "douyin"),
+            "count": len(items),
+            "items": items,
+        })
+
+    def _handle_snapshots(self, path):
+        """GET /api/snapshots/<platform>?keyword=  → 快照列表
+           GET /api/snapshots/<platform>/compare?keyword=&a=&b= → 对比结果"""
+        parts = path.strip("/").split("/")
+        if len(parts) < 3:
+            self._send_json({"error": "bad path"}, 400)
+            return
+        platform = parts[2]
+        qs = parse_qs(urlparse(self.path).query)
+        keyword = (qs.get("keyword") or [""])[0].strip()
+        if platform not in PLATFORMS:
+            self._send_json({"error": f"未知平台: {platform}"}, 400)
+            return
+        if not keyword:
+            self._send_json({"error": "缺少 keyword 参数"}, 400)
+            return
+
+        if len(parts) == 3:
+            snaps = web_queries.list_snapshots(platform, keyword)
+            self._send_json({
+                "platform": platform,
+                "platform_name": PLATFORMS[platform]["name"],
+                "keyword": keyword,
+                "snapshots": snaps,
+            })
+            return
+
+        if len(parts) == 4 and parts[3] == "compare":
+            a = qs.get("a", [""])[0]
+            b = qs.get("b", [""])[0]
+            try:
+                task_a, task_b = int(a), int(b)
+            except (TypeError, ValueError):
+                self._send_json({"error": "a/b 需为任务 ID"}, 400)
+                return
+            result = web_queries.compare_snapshots(platform, keyword, task_a, task_b)
+            if result is None:
+                self._send_json({"error": "任务不存在或不属于该关键词"}, 404)
+                return
+            result["platform_name"] = PLATFORMS[platform]["name"]
+            self._send_json(result)
+            return
+
+        self._send_json({"error": "not found"}, 404)
 
     # ---------- 静态文件 ----------
     def _serve_file(self, path, content_type):

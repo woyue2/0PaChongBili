@@ -176,6 +176,145 @@
   @keyframes blink { 50% { opacity: 0; } }
   .term-actions { display: flex; gap: 8px; }
   .term-empty { color: var(--muted); }
+
+  /* 页签 */
+  .tabs {
+    display: flex; gap: 4px;
+    padding: 0 24px;
+    border-bottom: 1px solid var(--border);
+    background: var(--panel);
+  }
+  .tab {
+    padding: 10px 18px;
+    border: none;
+    background: transparent;
+    color: var(--muted);
+    font-size: 14px;
+    cursor: pointer;
+    border-bottom: 2px solid transparent;
+    margin-bottom: -1px;
+    font-weight: 500;
+  }
+  .tab:hover { color: var(--text); }
+  .tab.active { color: var(--accent); border-bottom-color: var(--accent); }
+  .view { display: none; }
+  .view.active { display: block; }
+
+  /* 概览页 */
+  .overview-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(320px, 1fr)); gap: 16px; }
+  .kw-card {
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 14px 16px;
+    cursor: pointer;
+    transition: border-color .15s, transform .15s;
+  }
+  .kw-card:hover { border-color: var(--accent); transform: translateY(-1px); }
+  .kw-card .kw-head { display: flex; justify-content: space-between; align-items: baseline; margin-bottom: 6px; }
+  .kw-card .kw-name { font-size: 15px; font-weight: 700; }
+  .kw-card .kw-count { font-size: 12px; color: var(--muted); }
+  .kw-card .kw-dates { font-size: 12px; color: var(--accent); }
+  .kw-card .kw-dates .date { margin-right: 6px; background: rgba(47,129,247,.12); padding: 1px 8px; border-radius: 10px; }
+  .kw-card .kw-actions { margin-top: 10px; display: flex; gap: 8px; }
+  .kw-card .kw-actions button { padding: 4px 12px; font-size: 12px; }
+  .platform-header { margin: 18px 0 10px; font-size: 16px; font-weight: 700; display: flex; align-items: center; gap: 8px; }
+  .platform-header:first-child { margin-top: 0; }
+
+  /* 结果页（卡片，借鉴 OpenBiliClaw card-grid 风格） */
+  .toolbar {
+    display: flex; gap: 12px; align-items: flex-end;
+    padding: 16px 0; flex-wrap: wrap;
+  }
+  .toolbar .form-row { margin-bottom: 0; min-width: 140px; }
+  .card-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(260px, 1fr));
+    gap: 14px;
+  }
+  .video-card {
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    padding: 14px;
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    transition: transform .15s, box-shadow .15s, border-color .15s;
+  }
+  .video-card:hover { transform: translateY(-2px); border-color: var(--accent); box-shadow: 0 4px 16px rgba(0,0,0,.3); }
+  .vc-top { display: flex; justify-content: space-between; align-items: center; }
+  .vc-rank {
+    font-size: 22px; font-weight: 800;
+    min-width: 40px; height: 40px;
+    display: flex; align-items: center; justify-content: center;
+    border-radius: 10px;
+    background: linear-gradient(135deg, var(--accent), #1f6feb);
+    color: #fff;
+  }
+  .vc-rank.top { background: linear-gradient(135deg, #f0b90b, #d29922); }
+  .vc-platform {
+    font-size: 11px; padding: 2px 10px; border-radius: 10px;
+    background: rgba(47,129,247,.15); color: var(--accent);
+  }
+  .vc-title {
+    font-size: 14px; font-weight: 600; line-height: 1.45;
+    display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical;
+    overflow: hidden; min-height: 40px;
+  }
+  .vc-meta { font-size: 12px; color: var(--muted); }
+  .vc-stats { display: flex; gap: 12px; font-size: 12px; flex-wrap: wrap; }
+  .vc-stat b { color: var(--text); }
+  .vc-score-row { display: flex; align-items: center; gap: 8px; margin-top: auto; }
+  .vc-score-label { font-size: 11px; color: var(--muted); white-space: nowrap; }
+  .vc-score-bar { flex: 1; height: 6px; background: var(--bg); border-radius: 3px; overflow: hidden; }
+  .vc-score-fill { height: 100%; background: linear-gradient(90deg, var(--accent), #56d364); border-radius: 3px; }
+  .vc-score-val { font-size: 13px; font-weight: 700; color: var(--green); min-width: 42px; text-align: right; }
+  .vc-growth { font-size: 12px; font-weight: 600; }
+  .vc-growth.up { color: var(--green); }
+  .vc-growth.none { color: var(--muted); font-weight: 400; }
+  .vc-tags { display: flex; gap: 6px; flex-wrap: wrap; }
+  .vc-tag { font-size: 11px; padding: 1px 8px; border-radius: 8px; background: var(--bg); border: 1px solid var(--border); color: var(--muted); }
+  .vc-link { font-size: 12px; color: var(--accent); text-decoration: none; }
+  .vc-link:hover { text-decoration: underline; }
+  .no-data { grid-column: 1/-1; text-align: center; color: var(--muted); padding: 40px 0; }
+
+  /* 对比页 */
+  .compare-bar { display: flex; gap: 12px; align-items: flex-end; padding: 16px 0; flex-wrap: wrap; }
+  .compare-summary {
+    display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+    gap: 12px; margin: 12px 0;
+  }
+  .cmp-stat {
+    background: var(--panel); border: 1px solid var(--border);
+    border-radius: 10px; padding: 12px 16px;
+  }
+  .cmp-stat .num { font-size: 24px; font-weight: 800; }
+  .cmp-stat .label { font-size: 12px; color: var(--muted); margin-top: 2px; }
+  .cmp-stat.green .num { color: var(--green); }
+  .cmp-stat.red .num { color: var(--red); }
+  .cmp-stat.blue .num { color: var(--accent); }
+  .cmp-group { margin-bottom: 22px; }
+  .cmp-group h3 { font-size: 14px; margin-bottom: 10px; display: flex; align-items: center; gap: 8px; }
+  .cmp-group h3 .count-badge { font-size: 12px; background: var(--bg); border: 1px solid var(--border); border-radius: 10px; padding: 1px 10px; color: var(--muted); font-weight: 400; }
+  .cmp-item {
+    background: var(--panel); border: 1px solid var(--border);
+    border-radius: 10px; padding: 10px 14px; margin-bottom: 8px;
+    display: flex; justify-content: space-between; align-items: center; gap: 12px;
+  }
+  .cmp-item .ci-main { min-width: 0; }
+  .cmp-item .ci-title { font-size: 13px; font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .cmp-item .ci-meta { font-size: 12px; color: var(--muted); margin-top: 2px; }
+  .cmp-item .ci-value { text-align: right; flex-shrink: 0; }
+  .cmp-item .ci-value .num { font-size: 14px; font-weight: 700; }
+  .cmp-item.added { border-color: rgba(63,185,80,.4); }
+  .cmp-item.added .num { color: var(--green); }
+  .cmp-item.removed { opacity: .6; }
+  .cmp-item.removed .num { color: var(--muted); }
+  .cmp-item.changed .growth-up { color: var(--green); font-weight: 700; }
+  .cmp-item.changed .growth-down { color: var(--red); font-weight: 700; }
+  .cmp-item .ci-old { color: var(--muted); font-size: 12px; }
+  .cmp-item .ci-arrow { color: var(--muted); margin: 0 4px; }
 </style>
 </head>
 <body>
@@ -185,6 +324,15 @@
   <span class="badge"><span class="status-dot" id="healthDot"></span> <span id="healthText">连接中...</span></span>
 </header>
 
+<div class="tabs">
+  <button class="tab active" data-view="terminal" onclick="switchView('terminal')">🖥 终端</button>
+  <button class="tab" data-view="overview" onclick="switchView('overview')">🗂 关键词概览</button>
+  <button class="tab" data-view="results" onclick="switchView('results')">📊 结果排行</button>
+  <button class="tab" data-view="compare" onclick="switchView('compare')">🔀 快照对比</button>
+</div>
+
+<!-- 终端视图 -->
+<div class="view active" id="view-terminal">
 <main>
   <div class="col-left">
     <!-- 新建任务 -->
@@ -242,6 +390,75 @@
     </div>
   </div>
 </main>
+</div>
+
+<!-- 概览视图 -->
+<div class="view" id="view-overview">
+  <div style="padding: 16px 24px;">
+    <div id="overviewContent"><div class="empty">加载中...</div></div>
+  </div>
+</div>
+
+<!-- 结果视图 -->
+<div class="view" id="view-results">
+  <div style="padding: 0 24px;">
+    <div class="toolbar">
+      <div class="form-row">
+        <label>平台</label>
+        <select id="rPlatform">
+          <option value="bili">B站</option>
+          <option value="xhs">小红书</option>
+          <option value="douyin">抖音</option>
+          <option value="kuaishou">快手</option>
+        </select>
+      </div>
+      <div class="form-row">
+        <label>关键词</label>
+        <select id="rKeyword"><option value="">先选平台</option></select>
+      </div>
+      <div class="form-row">
+        <label>分析类型</label>
+        <select id="rAnalysis">
+          <option value="momentum">动量</option>
+          <option value="value">价值</option>
+        </select>
+      </div>
+      <button id="rLoadBtn">加载排行</button>
+    </div>
+    <div id="resultsContent"><div class="empty">选择平台和关键词后点击"加载排行"</div></div>
+  </div>
+</div>
+
+<!-- 对比视图 -->
+<div class="view" id="view-compare">
+  <div style="padding: 0 24px;">
+    <div class="compare-bar">
+      <div class="form-row">
+        <label>平台</label>
+        <select id="cPlatform">
+          <option value="bili">B站</option>
+          <option value="xhs">小红书</option>
+          <option value="douyin">抖音</option>
+          <option value="kuaishou">快手</option>
+        </select>
+      </div>
+      <div class="form-row">
+        <label>关键词</label>
+        <select id="cKeyword"><option value="">先选平台</option></select>
+      </div>
+      <div class="form-row">
+        <label>快照 A（旧）</label>
+        <select id="cSnapA"><option value="">先选关键词</option></select>
+      </div>
+      <div class="form-row">
+        <label>快照 B（新）</label>
+        <select id="cSnapB"><option value="">先选关键词</option></select>
+      </div>
+      <button id="cCompareBtn">开始对比</button>
+    </div>
+    <div id="compareContent"><div class="empty">选择平台、关键词和两个快照后点击"开始对比"。快照即每次爬取任务，可对比不同日期爬到的内容差异。</div></div>
+  </div>
+</div>
 
 <script>
 const $ = id => document.getElementById(id);
@@ -369,6 +586,308 @@ function statusText(s) {
 function escapeHtml(s) {
   return String(s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 }
+
+function fmtNum(n) {
+  if (n === null || n === undefined) return '-';
+  n = Number(n);
+  if (!isFinite(n)) return '-';
+  if (n >= 1e8) return (n/1e8).toFixed(2) + '亿';
+  if (n >= 1e4) return (n/1e4).toFixed(1) + '万';
+  return n.toLocaleString('zh-CN');
+}
+
+function fmtDate(s) {
+  if (!s) return '';
+  return String(s).slice(0, 10);
+}
+
+function fmtDateTime(s) {
+  if (!s) return '';
+  return String(s).slice(0, 16).replace('T', ' ');
+}
+
+// ---------- 页签切换 ----------
+function switchView(name) {
+  document.querySelectorAll('.tab').forEach(t => t.classList.toggle('active', t.dataset.view === name));
+  document.querySelectorAll('.view').forEach(v => v.classList.toggle('active', v.id === 'view-' + name));
+  if (name === 'overview' && !overviewLoaded) loadOverview();
+  if (name === 'results' && !resultsLoaded) { loadResultKeywords(); resultsLoaded = true; }
+  if (name === 'compare' && !compareLoaded) { loadCompareKeywords(); compareLoaded = true; }
+}
+let overviewLoaded = false;
+let resultsLoaded = false;
+let compareLoaded = false;
+
+// ---------- 概览页 ----------
+async function loadOverview() {
+  const el = $('overviewContent');
+  el.innerHTML = '<div class="empty">加载中...</div>';
+  try {
+    const data = await api('/api/analyses');
+    let html = '';
+    for (const [platform, info] of Object.entries(data)) {
+      html += `<div class="platform-header">${escapeHtml(info.name)} <span style="font-size:12px;color:var(--muted);font-weight:400;">${info.keywords.length} 个关键词</span></div>`;
+      if (!info.keywords.length) {
+        html += '<div class="empty">暂无数据</div>';
+        continue;
+      }
+      html += '<div class="overview-grid">';
+      for (const kw of info.keywords) {
+        const dates = kw.dates.map(d => `<span class="date">${d}</span>`).join('');
+        html += `
+          <div class="kw-card" data-platform="${platform}" data-keyword="${escapeHtml(kw.keyword)}">
+            <div class="kw-head">
+              <span class="kw-name">${escapeHtml(kw.keyword)}</span>
+              <span class="kw-count">${kw.task_count} 任务 · ${kw.done_count} 完成</span>
+            </div>
+            <div class="kw-dates">${dates}</div>
+            <div class="kw-actions">
+              <button class="ov-results">📊 看排行</button>
+              <button class="ov-compare">🔀 对比</button>
+            </div>
+          </div>`;
+      }
+      html += '</div>';
+    }
+    el.innerHTML = html;
+    // 绑定卡片跳转
+    el.querySelectorAll('.kw-card').forEach(card => {
+      const platform = card.dataset.platform;
+      const keyword = card.dataset.keyword;
+      card.querySelector('.ov-results').onclick = () => {
+        $('rPlatform').value = platform;
+        loadResultKeywords(platform).then(() => {
+          $('rKeyword').value = keyword;
+          loadResults();
+          switchView('results');
+        });
+      };
+      card.querySelector('.ov-compare').onclick = () => {
+        $('cPlatform').value = platform;
+        loadCompareKeywords(platform).then(() => {
+          $('cKeyword').value = keyword;
+          loadSnapshots();
+          switchView('compare');
+        });
+      };
+    });
+  } catch (e) {
+    el.innerHTML = `<div class="empty">加载失败: ${escapeHtml(e.message)}</div>`;
+  }
+}
+
+// ---------- 结果页 ----------
+async function loadResultKeywords(platform) {
+  const p = platform || $('rPlatform').value;
+  try {
+    const data = await api('/api/analyses');
+    const info = data[p] || {keywords: []};
+    const sel = $('rKeyword');
+    sel.innerHTML = '';
+    if (!info.keywords.length) {
+      sel.innerHTML = '<option value="">无数据</option>';
+      return;
+    }
+    for (const kw of info.keywords) {
+      const opt = document.createElement('option');
+      opt.value = kw.keyword;
+      opt.textContent = `${kw.keyword} (${kw.task_count}任务)`;
+      sel.appendChild(opt);
+    }
+  } catch (e) {
+    $('rKeyword').innerHTML = `<option value="">加载失败</option>`;
+  }
+}
+
+async function loadResults() {
+  const el = $('resultsContent');
+  el.innerHTML = '<div class="empty">加载中...</div>';
+  const platform = $('rPlatform').value;
+  const keyword = $('rKeyword').value;
+  const analysis = $('rAnalysis').value;
+  if (!keyword) { el.innerHTML = '<div class="empty">请选择关键词</div>'; return; }
+  try {
+    const data = await api(`/api/results/${platform}?keyword=${encodeURIComponent(keyword)}&analysis=${analysis}`);
+    if (!data.items.length) {
+      el.innerHTML = '<div class="empty">该关键词暂无排行数据</div>';
+      return;
+    }
+    let html = `<div style="margin:8px 0 14px;color:var(--muted);font-size:13px;">${escapeHtml(data.platform_name)} · ${escapeHtml(keyword)} · ${analysis === 'value' ? '价值分析' : '动量分析'} · 共 ${data.count} 条</div>`;
+    html += '<div class="card-grid">';
+    data.items.forEach((it, i) => {
+      const rank = i + 1;
+      const growth = it.growth_pct;
+      const growthHtml = growth === null || growth === undefined
+        ? '<span class="vc-growth none">首次采集</span>'
+        : `<span class="vc-growth up">↗ ${growth > 0 ? '+' : ''}${Number(growth).toFixed(1)}%</span>`;
+      const url = it.url ? `<a class="vc-link" href="${escapeHtml(it.url)}" target="_blank">打开 ↗</a>` : '';
+      html += `
+        <div class="video-card">
+          <div class="vc-top">
+            <div class="vc-rank ${rank <= 3 ? 'top' : ''}">${rank}</div>
+            <span class="vc-platform">${escapeHtml(data.platform_name)}</span>
+          </div>
+          <div class="vc-title">${escapeHtml(it.title)}</div>
+          <div class="vc-meta">${escapeHtml(it.author || '未知作者')}</div>
+          <div class="vc-stats">
+            <span class="vc-stat">🔥 <b>${fmtNum(it.metric_value)}</b></span>
+            <span class="vc-stat">📅 ${fmtDate(it.pubdate)}</span>
+          </div>
+          <div class="vc-score-row">
+            <span class="vc-score-label">${analysis === 'value' ? '价值分' : '动量分'}</span>
+            <div class="vc-score-bar"><div class="vc-score-fill" style="width:${Math.min(100, (it.score || 0) * 100)}%"></div></div>
+            <span class="vc-score-val">${Number(it.score || 0).toFixed(3)}</span>
+          </div>
+          ${growthHtml}
+          ${it.tags ? `<div class="vc-tags">${it.tags.split(',').slice(0,3).map(t => `<span class="vc-tag">${escapeHtml(t)}</span>`).join('')}</div>` : ''}
+          ${url}
+        </div>`;
+    });
+    html += '</div>';
+    el.innerHTML = html;
+  } catch (e) {
+    el.innerHTML = `<div class="empty">加载失败: ${escapeHtml(e.message)}</div>`;
+  }
+}
+
+$('rPlatform').onchange = () => loadResultKeywords();
+$('rLoadBtn').onclick = loadResults;
+
+// ---------- 对比页 ----------
+async function loadCompareKeywords(platform) {
+  const p = platform || $('cPlatform').value;
+  try {
+    const data = await api('/api/analyses');
+    const info = data[p] || {keywords: []};
+    const sel = $('cKeyword');
+    sel.innerHTML = '';
+    for (const kw of info.keywords) {
+      const opt = document.createElement('option');
+      opt.value = kw.keyword;
+      opt.textContent = `${kw.keyword} (${kw.task_count}任务)`;
+      sel.appendChild(opt);
+    }
+    if (info.keywords.length) {
+      sel.value = info.keywords[0].keyword;
+      loadSnapshots();
+    } else {
+      $('cSnapA').innerHTML = '<option value="">无数据</option>';
+      $('cSnapB').innerHTML = '<option value="">无数据</option>';
+    }
+  } catch (e) {
+    $('cKeyword').innerHTML = `<option value="">加载失败</option>`;
+  }
+}
+
+async function loadSnapshots() {
+  const platform = $('cPlatform').value;
+  const keyword = $('cKeyword').value;
+  if (!keyword) return;
+  try {
+    const data = await api(`/api/snapshots/${platform}?keyword=${encodeURIComponent(keyword)}`);
+    const snaps = data.snapshots || [];
+    const selA = $('cSnapA');
+    const selB = $('cSnapB');
+    selA.innerHTML = ''; selB.innerHTML = '';
+    if (!snaps.length) {
+      selA.innerHTML = '<option value="">无可对比快照</option>';
+      selB.innerHTML = '<option value="">无可对比快照</option>';
+      return;
+    }
+    for (const s of snaps) {
+      const label = `任务${s.task_id} · ${fmtDateTime(s.created_at)} · ${s.video_count}条`;
+      const oa = document.createElement('option'); oa.value = s.task_id; oa.textContent = label;
+      const ob = document.createElement('option'); ob.value = s.task_id; ob.textContent = label;
+      selA.appendChild(oa); selB.appendChild(ob);
+    }
+    // 默认 A 选最旧、B 选最新
+    selA.value = snaps[snaps.length - 1].task_id;
+    selB.value = snaps[0].task_id;
+  } catch (e) {
+    $('cSnapA').innerHTML = '<option value="">加载失败</option>';
+    $('cSnapB').innerHTML = '<option value="">加载失败</option>';
+  }
+}
+
+$('cPlatform').onchange = () => loadCompareKeywords();
+$('cKeyword').onchange = loadSnapshots;
+
+$('cCompareBtn').onclick = async () => {
+  const el = $('compareContent');
+  el.innerHTML = '<div class="empty">对比中...</div>';
+  const platform = $('cPlatform').value;
+  const keyword = $('cKeyword').value;
+  const a = $('cSnapA').value;
+  const b = $('cSnapB').value;
+  if (!a || !b) { el.innerHTML = '<div class="empty">请选择两个快照</div>'; return; }
+  if (a === b) { el.innerHTML = '<div class="empty">请选择两个不同的快照</div>'; return; }
+  try {
+    const data = await api(`/api/snapshots/${platform}/compare?keyword=${encodeURIComponent(keyword)}&a=${a}&b=${b}`);
+    const sa = data.snapshot_a, sb = data.snapshot_b;
+    const added = data.added || [], removed = data.removed || [], changed = data.changed || [];
+
+    let html = `<div class="compare-summary">
+      <div class="cmp-stat"><div class="num">${sa.count}</div><div class="label">快照A: 任务${sa.task_id} · ${fmtDateTime(sa.created_at)}</div></div>
+      <div class="cmp-stat"><div class="num">${sb.count}</div><div class="label">快照B: 任务${sb.task_id} · ${fmtDateTime(sb.created_at)}</div></div>
+      <div class="cmp-stat blue"><div class="num">${changed.length}</div><div class="label">📈 都有（增长对比）</div></div>
+      <div class="cmp-stat green"><div class="num">${added.length}</div><div class="label">🆕 B新增</div></div>
+      <div class="cmp-stat red"><div class="num">${removed.length}</div><div class="label">❌ A消失</div></div>
+    </div>`;
+
+    // 增长组
+    html += `<div class="cmp-group"><h3>📈 共同视频增长 <span class="count-badge">${changed.length}</span></h3>`;
+    if (!changed.length) html += '<div class="empty">两个快照没有共同视频（可能是不同搜索批次）</div>';
+    for (const it of changed) {
+      const g = it.growth_pct;
+      const gCls = (g !== null && g !== undefined && g >= 0) ? 'growth-up' : 'growth-down';
+      const gTxt = g === null || g === undefined ? '首次' : `${g > 0 ? '+' : ''}${Number(g).toFixed(1)}%`;
+      html += `<div class="cmp-item changed">
+        <div class="ci-main">
+          <div class="ci-title">${escapeHtml(it.title)}</div>
+          <div class="ci-meta">${escapeHtml(it.author || '')}${it.url ? ` · <a href="${escapeHtml(it.url)}" target="_blank" style="color:var(--accent)">链接</a>` : ''}</div>
+        </div>
+        <div class="ci-value">
+          <span class="ci-old">${fmtNum(it.metric_a)}</span><span class="ci-arrow">→</span>
+          <span class="num">${fmtNum(it.metric_b)}</span>
+          <div class="${gCls}">${gTxt}</div>
+        </div>
+      </div>`;
+    }
+    html += '</div>';
+
+    // 新增组
+    html += `<div class="cmp-group"><h3>🆕 快照B 新增 <span class="count-badge">${added.length}</span></h3>`;
+    if (!added.length) html += '<div class="empty">无新增</div>';
+    for (const it of added) {
+      html += `<div class="cmp-item added">
+        <div class="ci-main">
+          <div class="ci-title">${escapeHtml(it.title)}</div>
+          <div class="ci-meta">${escapeHtml(it.author || '')}${it.url ? ` · <a href="${escapeHtml(it.url)}" target="_blank" style="color:var(--accent)">链接</a>` : ''}</div>
+        </div>
+        <div class="ci-value"><span class="num">${fmtNum(it.metric)}</span></div>
+      </div>`;
+    }
+    html += '</div>';
+
+    // 消失组
+    html += `<div class="cmp-group"><h3>❌ 快照A 消失 <span class="count-badge">${removed.length}</span></h3>`;
+    if (!removed.length) html += '<div class="empty">无消失</div>';
+    for (const it of removed) {
+      html += `<div class="cmp-item removed">
+        <div class="ci-main">
+          <div class="ci-title">${escapeHtml(it.title)}</div>
+          <div class="ci-meta">${escapeHtml(it.author || '')}${it.url ? ` · <a href="${escapeHtml(it.url)}" target="_blank" style="color:var(--accent)">链接</a>` : ''}</div>
+        </div>
+        <div class="ci-value"><span class="num">${fmtNum(it.metric)}</span></div>
+      </div>`;
+    }
+    html += '</div>';
+
+    el.innerHTML = html;
+  } catch (e) {
+    el.innerHTML = `<div class="empty">对比失败: ${escapeHtml(e.message)}</div>`;
+  }
+};
 
 // ---------- 表单 ----------
 $('platform').onchange = () => {
