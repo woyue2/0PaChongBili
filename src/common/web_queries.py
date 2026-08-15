@@ -16,6 +16,7 @@ import threading
 from datetime import date, timedelta
 
 from src.common import paths
+from src.common import web_preferences
 
 # 各平台数据库路径
 _PLATFORM_DB = {
@@ -311,7 +312,13 @@ def get_ranking(platform, keyword, analysis="momentum", limit=100, as_of_date=No
             except Exception:
                 pass
 
-    return [_normalize_item(platform, i) for i in items]
+    # 永久隐藏（记录级黑名单）：隐藏的记录不进入任何结果视图，
+    # 但数据库原数据保留，重新采集也不会再显示。
+    hidden_set = web_preferences.list_hidden_records(platform)
+    normalized = [_normalize_item(platform, i) for i in items]
+    if hidden_set:
+        normalized = [n for n in normalized if str(n.get("id") or "") not in hidden_set]
+    return normalized
 
 
 def _as_of_snapshot(source, platform, as_of_date):
@@ -758,6 +765,13 @@ def compare_snapshots(platform, keyword, task_a, task_b):
         added.sort(key=lambda x: x["metric"], reverse=True)
         removed.sort(key=lambda x: x["metric"], reverse=True)
 
+        # 永久隐藏（记录级黑名单）：对比视图同样排除已隐藏记录
+        hidden_set = web_preferences.list_hidden_records(platform)
+        if hidden_set:
+            added = [x for x in added if str(x["id"]) not in hidden_set]
+            removed = [x for x in removed if str(x["id"]) not in hidden_set]
+            changed = [x for x in changed if str(x["id"]) not in hidden_set]
+
         return {
             "snapshot_a": {"task_id": task_a, "created_at": tasks[task_a]["created_at"],
                            "status": tasks[task_a]["status"], "count": len(snap_a)},
@@ -769,3 +783,52 @@ def compare_snapshots(platform, keyword, task_a, task_b):
         }
     finally:
         conn.close()
+
+
+# 各平台主表作者列名（用于黑名单视图展示）
+_AUTHOR_COL = {
+    "bili": "uploader",
+    "xhs": "nickname",
+    "douyin": "nickname",
+    "kuaishou": "nickname",
+}
+
+
+def list_blacklist(platform):
+    """黑名单管理视图数据：返回 [{record_id, hidden_at, note, title, author, url}, ...]
+
+    明细（hidden_at/note）来自 web_preferences.hidden_records，
+    标题/作者/链接来自各平台主表（记录若已被永久删除则缺省为空）。
+    """
+    if platform not in _PLATFORM_DB:
+        return []
+    entries = web_preferences.list_hidden_records_detail(platform)
+    if not entries:
+        return []
+    conn = _connect(platform)
+    if conn is None:
+        return entries
+    schema = _SCHEMA[platform]
+    id_col = schema["id_col"]
+    main_table = schema["main_table"]
+    author_col = _AUTHOR_COL.get(platform, "nickname")
+    ids = [e["record_id"] for e in entries]
+    placeholders = ",".join("?" for _ in ids)
+    try:
+        rows = conn.execute(
+            f"SELECT {id_col}, title, COALESCE({author_col}, '') AS author, url "
+            f"FROM {main_table} WHERE {id_col} IN ({placeholders})",
+            ids,
+        ).fetchall()
+        meta = {r[0]: {"title": r[1] or "", "author": r[2] or "", "url": r[3] or ""}
+                for r in rows}
+    except sqlite3.Error:
+        meta = {}
+    finally:
+        conn.close()
+    for e in entries:
+        m = meta.get(e["record_id"], {})
+        e["title"] = m.get("title", "")
+        e["author"] = m.get("author", "")
+        e["url"] = m.get("url", "")
+    return entries

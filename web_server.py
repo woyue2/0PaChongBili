@@ -233,12 +233,52 @@ class Handler(BaseHTTPRequestHandler):
                 self._send_json({"error": "not found"}, 404)
         elif path.startswith("/api/results/"):
             self._handle_results(path)
+        elif path.startswith("/api/blacklist"):
+            self._handle_blacklist(path)
         elif path.startswith("/api/result-dates/"):
             self._handle_result_dates(path)
         elif path.startswith("/api/snapshots/"):
             self._handle_snapshots(path)
         else:
             self._send_json({"error": "not found"}, 404)
+
+    def _handle_blacklist(self, path):
+        """GET /api/blacklist?platform= → 黑名单明细（含标题/作者/链接）
+        POST /api/blacklist/note → 保存黑名单条目备注
+        """
+        if self.command == "GET":
+            qs = parse_qs(urlparse(self.path).query)
+            platform = (qs.get("platform") or [""])[0].strip()
+            if platform not in PLATFORMS:
+                self._send_json({"error": f"未知平台: {platform}"}, 400)
+                return
+            try:
+                items = web_queries.list_blacklist(platform)
+            except Exception as e:
+                self._send_json({"error": f"加载黑名单失败: {e}"}, 500)
+                return
+            self._send_json({"platform": platform, "items": items})
+            return
+
+        if path == "/api/blacklist/note":
+            body = self._read_json()
+            platform = body.get("platform")
+            record_id = body.get("record_id")
+            note = body.get("note", "")
+            if platform not in PLATFORMS or record_id is None or not str(record_id).strip():
+                self._send_json({"error": "platform/record_id 参数无效"}, 400)
+                return
+            try:
+                web_preferences.set_hidden_record_note(platform, record_id, note)
+            except ValueError as e:
+                self._send_json({"error": str(e)}, 400)
+            except Exception as e:
+                self._send_json({"error": f"保存备注失败: {e}"}, 500)
+            else:
+                self._send_json({"ok": True, "record_id": str(record_id)})
+            return
+
+        self._send_json({"error": "not found"}, 404)
 
     def do_POST(self):
         path = urlparse(self.path).path
@@ -312,12 +352,30 @@ class Handler(BaseHTTPRequestHandler):
             try:
                 web_queries.delete_record(platform, record_id)
                 web_preferences.delete_record_note(platform, record_id)
+                web_preferences.set_record_hidden(platform, record_id, False)
             except ValueError as e:
                 self._send_json({"error": str(e)}, 404)
             except Exception as e:
                 self._send_json({"error": f"删除失败: {e}"}, 500)
             else:
                 self._send_json({"ok": True, "record_id": str(record_id)})
+
+        elif path == "/api/results/hide":
+            body = self._read_json()
+            platform = body.get("platform")
+            record_id = body.get("record_id")
+            hidden = body.get("hidden") is True
+            if platform not in PLATFORMS or record_id is None or not str(record_id).strip():
+                self._send_json({"error": "platform/record_id 参数无效"}, 400)
+                return
+            try:
+                web_preferences.set_record_hidden(platform, record_id, hidden)
+            except ValueError as e:
+                self._send_json({"error": str(e)}, 400)
+            except Exception as e:
+                self._send_json({"error": f"隐藏失败: {e}"}, 500)
+            else:
+                self._send_json({"ok": True, "record_id": str(record_id), "hidden": hidden})
 
         elif path.startswith("/api/tasks/") and path.endswith("/kill"):
             parts = path.strip("/").split("/")
@@ -404,11 +462,13 @@ class Handler(BaseHTTPRequestHandler):
         items = all_items[start:start + page_size]
         hidden = web_preferences.list_hidden_days(platform, [item.get("id") for item in items])
         notes = web_preferences.list_record_notes(platform, [item.get("id") for item in items])
+        rec_hidden = web_preferences.list_hidden_records(platform)
         for item in items:
             record_id = str(item.get("id"))
             item["hidden_history_days"] = hidden.get(record_id, [])
             item["note"] = notes.get(record_id, {}).get("content", "")
             item["note_updated_at"] = notes.get(record_id, {}).get("updated_at")
+            item["hidden"] = record_id in rec_hidden
         self._send_json({
             "platform": platform,
             "platform_name": PLATFORMS[platform]["name"],

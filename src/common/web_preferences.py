@@ -33,6 +33,22 @@ def _connect():
             PRIMARY KEY (platform, record_id)
         )
     """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS hidden_records (
+            platform TEXT NOT NULL,
+            record_id TEXT NOT NULL,
+            hidden_at TEXT NOT NULL,
+            note TEXT NOT NULL DEFAULT '',
+            PRIMARY KEY (platform, record_id)
+        )
+    """)
+    # 兼容早期版本（无 note 列）的库
+    try:
+        cols = conn.execute("PRAGMA table_info(hidden_records)").fetchall()
+        if not any(row[1] == "note" for row in cols):
+            conn.execute("ALTER TABLE hidden_records ADD COLUMN note TEXT NOT NULL DEFAULT ''")
+    except sqlite3.Error:
+        pass
     return conn
 
 
@@ -136,5 +152,111 @@ def delete_record_note(platform, record_id):
             (str(platform), str(record_id)),
         )
         conn.commit()
+    finally:
+        conn.close()
+
+
+def set_record_hidden(platform, record_id, hidden):
+    """永久隐藏/恢复一条记录（按 platform+record_id）。
+
+    隐藏后该记录在 Web 结果视图中不再出现，但数据库原数据保留，
+    重新采集时走 ON CONFLICT UPDATE，不会清除隐藏标记。
+    """
+    platform = str(platform or "").strip()
+    record_id = str(record_id or "").strip()
+    if not platform or not record_id:
+        raise ValueError("platform/record_id 参数无效")
+    if platform not in ("bili", "xhs", "douyin", "kuaishou"):
+        raise ValueError("未知平台")
+    conn = _connect()
+    try:
+        if hidden:
+            # ON CONFLICT 仅刷新 hidden_at，保留已存在的 note
+            conn.execute(
+                "INSERT INTO hidden_records (platform, record_id, hidden_at, note) "
+                "VALUES (?, ?, ?, '') "
+                "ON CONFLICT(platform, record_id) DO UPDATE SET hidden_at = excluded.hidden_at",
+                (platform, record_id, datetime.now().isoformat(timespec="seconds")),
+            )
+        else:
+            conn.execute(
+                "DELETE FROM hidden_records WHERE platform = ? AND record_id = ?",
+                (platform, record_id),
+            )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def list_hidden_records(platform):
+    """返回某平台全部被隐藏的 record_id 集合（str）。"""
+    platform = str(platform or "").strip()
+    if not platform:
+        return set()
+    conn = _connect()
+    try:
+        rows = conn.execute(
+            "SELECT record_id FROM hidden_records WHERE platform = ?",
+            (platform,),
+        ).fetchall()
+        return {str(r[0]) for r in rows}
+    finally:
+        conn.close()
+
+
+def is_record_hidden(platform, record_id):
+    platform = str(platform or "").strip()
+    record_id = str(record_id or "").strip()
+    if not platform or not record_id:
+        return False
+    conn = _connect()
+    try:
+        row = conn.execute(
+            "SELECT 1 FROM hidden_records WHERE platform = ? AND record_id = ? LIMIT 1",
+            (platform, record_id),
+        ).fetchone()
+        return row is not None
+    finally:
+        conn.close()
+
+
+def set_hidden_record_note(platform, record_id, note):
+    """更新黑名单条目的备注（仅当该记录已在黑名单中时生效）。"""
+    platform = str(platform or "").strip()
+    record_id = str(record_id or "").strip()
+    if not platform or not record_id:
+        raise ValueError("platform/record_id 参数无效")
+    note = (note or "").strip()
+    if len(note) > MAX_NOTE_LENGTH:
+        raise ValueError(f"备注不能超过 {MAX_NOTE_LENGTH} 个字符")
+    conn = _connect()
+    try:
+        conn.execute(
+            "UPDATE hidden_records SET note = ? WHERE platform = ? AND record_id = ?",
+            (note, platform, record_id),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def list_hidden_records_detail(platform):
+    """返回某平台黑名单条目明细，按拉黑时间倒序：
+    [{record_id, hidden_at, note}, ...]
+    """
+    platform = str(platform or "").strip()
+    if not platform:
+        return []
+    conn = _connect()
+    try:
+        rows = conn.execute(
+            "SELECT record_id, hidden_at, note FROM hidden_records "
+            "WHERE platform = ? ORDER BY hidden_at DESC",
+            (platform,),
+        ).fetchall()
+        return [
+            {"record_id": str(r[0]), "hidden_at": r[1], "note": r[2] or ""}
+            for r in rows
+        ]
     finally:
         conn.close()
